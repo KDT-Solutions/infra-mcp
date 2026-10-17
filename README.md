@@ -59,6 +59,10 @@ Alle schreibenden Tools führen nur mit `confirm=true` aus. Ohne `confirm` liefe
 | `portainer_stack_create(name, endpoint_id, compose_content, env, allow_docker_socket=false, confirm)` | Neuer Compose-Stack. Vorher geprüft (siehe Compose-Prüfung), Name frei. Wartet auf das asynchrone Deploy und meldet die Fehlermeldung von Portainer |
 | `portainer_stack_update(stack_id, compose_content, env_set, env_unset, pull_image=true, allow_docker_socket=false, confirm)` | Bestehenden Compose-Stack ändern und neu ausrollen (`Prune=false`). Compose-Datei ersetzen und/oder einzelne Env-Variablen setzen/entfernen; alle übrigen Env-Werte bleiben erhalten und laufen nicht durch den Chat. Vorschau mit geschwärztem Diff und den betroffenen Env-Namen. Nicht für Git-Stacks |
 
+### Git-Stacks (Portainer ab 2.4x)
+
+Portainer speichert die Git-Daten eines Stacks in einer GitOps-Source. Hat der API-Benutzer keinen Zugriff auf diese Source, liefert die API `GitConfig: null`, `WorkflowID` ist aber gesetzt. infra-mcp behandelt jeden Stack mit `WorkflowID` als Git-Stack und schickt dafür nie `PUT /stacks/{id}` - das würde die Git-Anbindung lösen und den Stack zum Editor-Stack machen. Redeploys laufen immer über `git/redeploy`; ohne Zugriff auf die Source meldet das Tool, dass der Benutzer Zugriff auf die Source braucht. `portainer_stack_update` ist für Git-Stacks gesperrt.
+
 ### Compose-Prüfung
 
 Gilt für `portainer_stack_create`, `portainer_stack_update` und `infra_publish_service`. Blockiert wird alles, womit ein Container aus seiner Isolation ausbricht:

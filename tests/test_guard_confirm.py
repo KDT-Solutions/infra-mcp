@@ -504,3 +504,46 @@ async def test_stack_update_reports_deploy_error(mock):
 
     with pytest.raises(PortainerError, match="already allocated"):
         await tools_portainer.portainer_stack_update(9, compose_content=NEW_COMPOSE, confirm=True)
+
+
+# ---------------------------------------------------------------------------
+# Git-Stacks ohne sichtbare GitConfig (Portainer 2.4x, kein Zugriff auf die GitOps-Source)
+# ---------------------------------------------------------------------------
+
+
+async def test_redeploy_workflow_stack_uses_git_endpoint_never_put(mock):
+    mock.get(f"{PORTAINER_API}/stacks/11").respond(
+        200, json={"Id": 11, "Name": "gitapp", "Type": 2, "EndpointId": 1, "GitConfig": None, "WorkflowID": 4, "Status": 1}
+    )
+    mock.get(f"{PORTAINER_API}/endpoints/1/docker/containers/json").respond(200, json=[])
+    put = mock.put(f"{PORTAINER_API}/stacks/11").respond(200, json={})
+    git = mock.put(f"{PORTAINER_API}/stacks/11/git/redeploy").respond(200, json={})
+    prev = await tools_portainer.portainer_stack_redeploy(11)
+    assert prev["method"] == "git_redeploy"
+    assert prev["stack"]["git"]["workflow_id"] == 4
+    out = await tools_portainer.portainer_stack_redeploy(11, confirm=True)
+    assert out["method"] == "git_redeploy" and git.call_count == 1 and put.call_count == 0
+
+
+async def test_redeploy_workflow_stack_without_source_access_explains(mock):
+    mock.get(f"{PORTAINER_API}/stacks/12").respond(
+        200, json={"Id": 12, "Name": "gitapp2", "Type": 2, "EndpointId": 1, "WorkflowID": 5}
+    )
+    mock.get(f"{PORTAINER_API}/endpoints/1/docker/containers/json").respond(200, json=[])
+    put = mock.put(f"{PORTAINER_API}/stacks/12").respond(200, json={})
+    mock.put(f"{PORTAINER_API}/stacks/12/git/redeploy").respond(400, json={"message": "Stack is not created from git"})
+    from infra_mcp.errors import PortainerError
+
+    with pytest.raises(PortainerError, match="GitOps-Source"):
+        await tools_portainer.portainer_stack_redeploy(12, confirm=True)
+    assert put.call_count == 0
+
+
+async def test_stack_update_refuses_workflow_stack(mock):
+    mock.get(f"{PORTAINER_API}/stacks/13").respond(
+        200, json={"Id": 13, "Name": "gitapp3", "Type": 2, "EndpointId": 1, "WorkflowID": 6}
+    )
+    put = mock.put(f"{PORTAINER_API}/stacks/13").respond(200, json={})
+    with pytest.raises(GuardError, match="Git"):
+        await tools_portainer.portainer_stack_update(13, compose_content="services:\n  a:\n    image: x\n", confirm=True)
+    assert put.call_count == 0

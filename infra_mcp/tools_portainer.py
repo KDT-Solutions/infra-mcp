@@ -123,6 +123,14 @@ def inspect_summary(data: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def is_git_stack(s: dict[str, Any]) -> bool:
+    """Git-Stack, auch wenn GitConfig fehlt: Ab Portainer 2.4x hängen die Git-Daten an einer
+    GitOps-Source. Hat der API-Benutzer keinen Zugriff auf diese Source, liefert Portainer
+    GitConfig=null, aber WorkflowID bleibt gesetzt. Ein PUT /stacks/{id} würde die Git-Anbindung
+    eines solchen Stacks lösen - deshalb gilt WorkflowID immer als Git-Stack."""
+    return bool(s.get("GitConfig")) or bool(s.get("WorkflowID"))
+
+
 def stack_summary(s: dict[str, Any]) -> dict[str, Any]:
     git = s.get("GitConfig") or None
     return {
@@ -131,7 +139,15 @@ def stack_summary(s: dict[str, Any]) -> dict[str, Any]:
         "type": STACK_TYPES.get(s.get("Type"), s.get("Type")),
         "status": STACK_STATUS.get(s.get("Status"), s.get("Status")),
         "endpoint_id": s.get("EndpointId"),
-        "git": {"url": git.get("URL"), "reference": git.get("ReferenceName"), "file": git.get("ConfigFilePath")} if git else None,
+        "git": (
+            {"url": git.get("URL"), "reference": git.get("ReferenceName"), "file": git.get("ConfigFilePath")}
+            if git
+            else (
+                {"workflow_id": s.get("WorkflowID"), "hinweis": "Git-Stack, Details nicht sichtbar (kein Zugriff auf die GitOps-Source)"}
+                if s.get("WorkflowID")
+                else None
+            )
+        ),
         "env_names": guard.env_names(s.get("Env")),
         "created": _ts(s.get("CreationDate")),
         "updated": _ts(s.get("UpdateDate")),
@@ -466,13 +482,22 @@ async def redeploy_stack(stack: dict[str, Any], pull_image: bool) -> dict[str, A
     Git-Stack: PUT /stacks/{id}/git/redeploy. Immer prune=false."""
     sid, eid = stack["Id"], stack.get("EndpointId")
     pull = bool(pull_image)
-    if stack.get("GitConfig"):
+    if is_git_stack(stack):
+        # Nie PUT /stacks/{id} auf einen Git-Stack: Portainer würde die Git-Anbindung lösen.
         payload = {
             "Prune": False,
             "PullImage": pull,
             "RepullImageAndRedeploy": pull,
         }
-        await portainer().stack_git_redeploy(sid, eid, payload)
+        try:
+            await portainer().stack_git_redeploy(sid, eid, payload)
+        except PortainerError as exc:
+            if not stack.get("GitConfig"):
+                raise PortainerError(
+                    f"{exc} - Stack {sid} ist ein Git-Stack, der API-Benutzer hat aber keinen Zugriff auf "
+                    "dessen GitOps-Source. In Portainer dem Benutzer bzw. seinem Team Zugriff auf die Source geben."
+                ) from None
+            raise
         done = await wait_for_stack_deploy(sid)
         return {"method": "git_redeploy", "pull_image": pull, "prune": False, "stack_status": done["status"]}
     content = await portainer().stack_file(sid)
@@ -511,7 +536,7 @@ async def portainer_stack_redeploy(stack_id: int, pull_image: bool = True, confi
         return guard.preview(
             "stack_redeploy",
             stack=summary,
-            method="git_redeploy" if stack.get("GitConfig") else "compose_update",
+            method="git_redeploy" if is_git_stack(stack) else "compose_update",
             pull_image=bool(pull_image),
             prune=False,
         )
@@ -623,7 +648,7 @@ async def portainer_stack_update(
     betroffenen Env-Namen."""
     stack = await _stack_checked(stack_id)
     _require_compose_type(stack)
-    if stack.get("GitConfig"):
+    if is_git_stack(stack):
         raise GuardError(
             f"Stack '{stack.get('Name')}' wird aus Git ausgerollt; die Compose-Datei dort ändern und "
             "portainer_stack_redeploy verwenden."
