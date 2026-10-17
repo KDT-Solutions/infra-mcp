@@ -138,7 +138,7 @@ DNS-Einträge legt infra-mcp nicht an. Fehlt einer, meldet das Tool den nötigen
 | `NODE_EXPORTER_URL` | für Host-Ressourcen | in der Compose-Datei `http://infra-mcp-node-exporter:9100/metrics` | leer = Host-Tools und Aufzeichnung aus |
 | `METRICS_INTERVAL` | nein | `60` | Messintervall in Sekunden (min. 10) |
 | `METRICS_FILE` | nein | `/data/host-metrics.jsonl` | Datei für den 24-h-Verlauf |
-| `MCP_HOST_PORT` | nein | `8426` | Host-Port |
+| `MCP_HOST_PORT` | nein | `8427` | Host-Port |
 | `MCP_BIND_ADDR` | nein | `0.0.0.0` | Bind-Adresse des Host-Ports (alle Interfaces, wie bei den übrigen MCP-Stacks) |
 | `LOG_LEVEL` | nein | `INFO` | |
 
@@ -213,7 +213,7 @@ Ohne `APP_VERSION` meldet `infra_version` die Version `dev-<kurzer Commit>`.
 2. In Portainer **als Administrator** einen neuen Stack aus `docker-compose.yml` anlegen (Repository oder Web-Editor) und die Variablen setzen (siehe `.env.example`), mindestens `PORTAINER_URL`, `PORTAINER_API_KEY`, `NPM_URL`, `NPM_USER`, `NPM_PASSWORD`, `NPM_DOCKER_NETWORK`, `PUBLIC_IP`, `PROTECTED_DOMAINS`, `MCP_API_KEY` (z.B. `openssl rand -hex 32`).
 3. Der Stack hängt im Docker-Netz von NPM (`NPM_DOCKER_NETWORK`), dadurch ist die NPM-API intern unter `http://<npm-container>:81/api` erreichbar. Port 81 bleibt nicht öffentlich.
 4. DNS: A-Record für die Subdomain von infra-mcp (z.B. `infra-mcp.example.com`) auf die öffentliche IP.
-5. In NPM einen Proxy-Host anlegen: Domain `infra-mcp.example.com` -> `http://<Host-IP>:8426` (wie die übrigen MCP-Stacks) oder über das gemeinsame Docker-Netz `http://infra-mcp:8000`, Let's-Encrypt-Zertifikat, Force SSL. Diese Domain in `PROTECTED_DOMAINS` aufnehmen.
+5. In NPM einen Proxy-Host anlegen: Domain `infra-mcp.example.com` -> `http://<Host-IP>:8427` (wie die übrigen MCP-Stacks) oder über das gemeinsame Docker-Netz `http://infra-mcp:8000`, Let's-Encrypt-Zertifikat, Force SSL. Diese Domain in `PROTECTED_DOMAINS` aufnehmen.
 6. Prüfen: `curl -i https://infra-mcp.example.com/healthz` liefert `401`, mit `-H "Authorization: Bearer <MCP_API_KEY>"` liefert es `200`.
 
 ## Als Connector in Claude hinzufügen
