@@ -74,7 +74,6 @@ class NpmClient:
         self._clock = clock
         self._token: str | None = None
         self._expires: float = 0.0
-        self._legacy_le_meta: bool | None = None
         self._client = httpx.AsyncClient(
             base_url=base_url.rstrip("/"),
             headers={"Accept": "application/json"},
@@ -188,12 +187,11 @@ class NpmClient:
 
     async def legacy_letsencrypt_meta(self) -> bool:
         """True, wenn die installierte NPM-Version meta.letsencrypt_email/agree erwartet (bis v2.12).
-        Erkannt am API-Schema (GET /api/schema), nicht an der Versionsnummer."""
-        if self._legacy_le_meta is None:
-            schema = await self._request("GET", "/schema")
-            text = schema if isinstance(schema, str) else json.dumps(schema)
-            self._legacy_le_meta = "letsencrypt_email" in text
-        return self._legacy_le_meta
+        Erkannt am API-Schema (GET /api/schema), nicht an der Versionsnummer. Bewusst bei
+        jedem Aufruf neu, damit ein NPM-Update ohne Neustart von infra-mcp greift."""
+        schema = await self._request("GET", "/schema")
+        text = schema if isinstance(schema, str) else json.dumps(schema)
+        return "letsencrypt_email" in text
 
     async def proxy_hosts(self) -> list[dict[str, Any]]:
         return await self._request("GET", "/nginx/proxy-hosts", params={"expand": "certificate,access_list"}) or []

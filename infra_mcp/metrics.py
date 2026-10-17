@@ -73,7 +73,6 @@ _WANTED = (
     "node_load15",
     "node_filesystem_size_bytes",
     "node_filesystem_avail_bytes",
-    "node_filesystem_readonly",
     "node_boot_time_seconds",
     "node_time_seconds",
 )
@@ -124,7 +123,6 @@ def memory(data: dict) -> dict[str, Any]:
 def disks(data: dict) -> list[dict[str, Any]]:
     sizes = {(lb.get("device"), lb.get("mountpoint"), lb.get("fstype")): v for lb, v in data.get("node_filesystem_size_bytes") or []}
     avails = {(lb.get("device"), lb.get("mountpoint"), lb.get("fstype")): v for lb, v in data.get("node_filesystem_avail_bytes") or []}
-    ro = {(lb.get("device"), lb.get("mountpoint"), lb.get("fstype")): v for lb, v in data.get("node_filesystem_readonly") or []}
     out: list[dict[str, Any]] = []
     seen_devices: set[str] = set()
     for key in sorted(sizes, key=lambda k: len(k[1] or "")):
@@ -147,7 +145,6 @@ def disks(data: dict) -> list[dict[str, Any]]:
                 "free_gib": round(avail / 1073741824, 1),
                 "used_percent": used_pct,
                 "warning": used_pct >= DISK_WARN_PERCENT,
-                "readonly": bool(ro.get(key)),
             }
         )
     return out

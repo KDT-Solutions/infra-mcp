@@ -64,6 +64,7 @@ def test_disks_filter_and_warning():
     assert [d["mountpoint"] for d in disks] == ["/", "/srv"]  # tmpfs und Bind-Mount des gleichen Geräts weg
     root = disks[0]
     assert root["used_percent"] == 90.0 and root["warning"] is True and root["free_gib"] == 10.0
+    assert "readonly" not in root
     assert disks[1]["warning"] is False
 
 

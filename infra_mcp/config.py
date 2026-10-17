@@ -60,6 +60,7 @@ class Settings:
     node_exporter_url: str = ""
     metrics_interval: int = 60
     metrics_file: str = ""
+    docker_host_ip: str = ""
 
     def secret_values(self) -> tuple[str, ...]:
         """Werte, die in keiner Ausgabe und keinem Log auftauchen dürfen."""
@@ -85,6 +86,7 @@ def load_settings() -> Settings:
         node_exporter_url=env.get("NODE_EXPORTER_URL", "").strip(),
         metrics_interval=max(10, _int(env.get("METRICS_INTERVAL"), 60)),
         metrics_file=env.get("METRICS_FILE", "").strip(),
+        docker_host_ip=env.get("DOCKER_HOST_IP", "").strip(),
     )
 
 

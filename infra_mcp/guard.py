@@ -352,3 +352,47 @@ def compose_service_networks(doc: dict[str, Any], service: str) -> list[str]:
         real = definition.get("name") if isinstance(definition, dict) and definition.get("name") else key
         out.append(str(real))
     return out
+
+
+_VAR_RE = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)(?:(:?[-?])([^}]*))?\}|\$([A-Za-z_][A-Za-z0-9_]*)")
+
+
+def interpolate(value: str, env: dict[str, str] | None) -> str:
+    """Compose-Variablen ${VAR}, ${VAR:-default}, ${VAR-default}, $VAR mit den Stack-Env-Werten auflösen."""
+    env = env or {}
+
+    def repl(m: re.Match) -> str:
+        name = m.group(1) or m.group(4)
+        op, default = m.group(2), m.group(3) or ""
+        val = env.get(name)
+        if op == ":-" and not val:
+            return default
+        if op == "-" and val is None:
+            return default
+        return "" if val is None else str(val)
+
+    return _VAR_RE.sub(repl, str(value))
+
+
+def compose_published_port(
+    doc: dict[str, Any], service: str, container_port: int, env: dict[str, str] | None = None
+) -> tuple[str, int] | None:
+    """(Bind-Adresse, Host-Port), unter dem der Dienst container_port auf dem Host veröffentlicht.
+    Bind-Adresse "" = alle Interfaces. None, wenn der Port nicht veröffentlicht wird."""
+    svc = doc["services"].get(service) or {}
+    for entry in svc.get("ports") or []:
+        if isinstance(entry, dict):
+            target = interpolate(str(entry.get("target", "")), env)
+            published = interpolate(str(entry.get("published", "")), env)
+            host_ip = interpolate(str(entry.get("host_ip", "")), env)
+        else:
+            spec = interpolate(str(entry), env).split("/", 1)[0]
+            parts = spec.split(":")
+            if len(parts) == 1:
+                continue  # nur Container-Port, Docker wählt einen zufälligen Host-Port
+            target = parts[-1]
+            published = parts[-2]
+            host_ip = ":".join(parts[:-2])
+        if target.strip().isdigit() and int(target) == int(container_port) and published.strip().isdigit():
+            return host_ip.strip().strip("[]"), int(published)
+    return None

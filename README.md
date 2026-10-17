@@ -96,7 +96,11 @@ infra-mcp fragt den node-exporter alle `METRICS_INTERVAL` Sekunden (Standard 60)
 
 CPU-% = Anteil der CPU-Zeit ausser `idle` und `iowait`, über alle Kerne. RAM belegt = `MemTotal - MemAvailable`. Disk belegt wie `df` (Grösse minus für Benutzer verfügbar); flüchtige Dateisysteme (tmpfs, overlay usw.) und Docker-interne Mounts sind ausgeblendet.
 
-`service` bei `infra_publish_service` ist nur nötig, wenn die Compose-Datei mehrere Dienste hat. Der Dienst muss im Docker-Netz von NPM hängen, z.B.:
+`service` bei `infra_publish_service` ist nur nötig, wenn die Compose-Datei mehrere Dienste hat. `forward_port` ist der Port im Container.
+
+**Mit `DOCKER_HOST_IP` (empfohlen):** Der Dienst veröffentlicht `forward_port` auf einem Host-Port, z.B. `ports: ["8430:8000"]` oder `"${MCP_BIND_ADDR:-0.0.0.0}:${MCP_HOST_PORT:-8430}:8000"` (Variablen werden mit `env` aufgelöst). Vor dem Anlegen wird geprüft, dass der Host-Port weder von einem für `mcp` sichtbaren Container noch von einem NPM-Proxy-Host auf `DOCKER_HOST_IP` belegt ist; bei Konflikt nennt das Tool den nächsten freien Port. Eine Bindung an `127.0.0.1` wird abgelehnt, da NPM den Dienst dann nicht erreicht.
+
+**Ohne `DOCKER_HOST_IP`:** Der Dienst muss im Docker-Netz von NPM hängen, z.B.:
 
 ```yaml
 services:
@@ -129,7 +133,8 @@ DNS-Einträge legt infra-mcp nicht an. Fehlt einer, meldet das Tool den nötigen
 | `NPM_URL` | ja | - | intern, z.B. `http://npm:81/api` |
 | `NPM_USER` / `NPM_PASSWORD` | ja | - | eigener NPM-Benutzer für den MCP (E-Mail und Passwort) |
 | `NPM_DEFAULT_EMAIL` | nur NPM bis v2.12 | - | Let's-Encrypt-E-Mail. Ab NPM v2.13 nimmt NPM die E-Mail des angemeldeten NPM-Benutzers, das Feld wird dann nicht gesendet |
-| `NPM_DOCKER_NETWORK` | für `infra_publish_service` | - | Docker-Netz, in dem NPM hängt |
+| `DOCKER_HOST_IP` | empfohlen | - | LAN-IP des Docker-Hosts. Gesetzt: `infra_publish_service` leitet auf `<DOCKER_HOST_IP>:<Host-Port>` weiter (Host-Port aus der Compose-Datei, vorher auf frei geprüft), und Proxy-Hosts werden über den Host-Port ihrem Stack zugeordnet |
+| `NPM_DOCKER_NETWORK` | nur ohne `DOCKER_HOST_IP` | - | Docker-Netz, in dem NPM hängt; dann leitet NPM direkt auf den Containernamen weiter |
 | `PUBLIC_IP` | für SSL-Hosts | - | öffentliche IP, auf die neue Domains zeigen müssen |
 | `PROTECTED_CONTAINERS` | nein | - | kommagetrennt, Glob-Muster (`db-*`). Immer zusätzlich geschützt: `portainer*`, `nginx-proxy-manager*`, `npm*`, `infra-mcp*` und der eigene Container |
 | `PROTECTED_STACKS` | nein | - | wie oben, gleiche Standardmuster |
@@ -185,12 +190,12 @@ Zusätzlich: Zwei-Faktor-Anmeldung für diesen Benutzer aus, und ab NPM v2.13 mu
 
 | Komponente | Stand |
 |---|---|
-| Portainer | API-Pfade und Payloads gegen den Quellcode **2.45.2** geprüft. Noch nicht gegen eine laufende Instanz getestet |
-| Nginx Proxy Manager | Payloads gegen den Quellcode **v2.16.0** geprüft (Let's-Encrypt-Altformat gegen v2.12.6). Noch nicht gegen eine laufende Instanz getestet |
-| node-exporter | v1.12.1 (Standardausschlüsse für Dateisysteme gegen den Quellcode geprüft) |
+| Portainer | **CE 2.45.2** (Docker 28.5.2): lesende Tools live getestet. Schreibende Payloads gegen den Quellcode 2.45.2 geprüft |
+| Nginx Proxy Manager | **v2.16.0** und **v2.12.6**: lesende Tools live getestet. Payloads gegen den Quellcode beider Versionen geprüft; das Let's-Encrypt-Format wird bei jeder Zertifikatsanforderung am Schema der Instanz erkannt |
+| node-exporter | v1.12.1, live getestet |
 | Python / SDK | Python 3.12 (Image), `mcp==2.3.0` |
 
-Die Tests laufen mit gemockten APIs. Nach dem ersten Einsatz hier die tatsächlich eingesetzten Versionen eintragen.
+Die automatischen Tests laufen mit gemockten APIs. Schreibende Tools sind gegen die laufenden Instanzen noch nicht ausgeführt worden.
 
 ## Release (nur über Git-Tags)
 

@@ -119,3 +119,14 @@ async def test_legacy_schema_detection(mock):
     mock.post(f"{NPM_API}/tokens").respond(200, json={"token": "t", "expires": "2999-01-01T00:00:00Z"})
     mock.get(f"{NPM_API}/schema").respond(200, json={"x": {"letsencrypt_email": {"type": "string"}}})
     assert await client().legacy_letsencrypt_meta() is True
+
+
+async def test_schema_detection_not_cached(mock):
+    """Nach einem NPM-Update muss die neue Variante ohne Neustart erkannt werden."""
+    mock.post(f"{NPM_API}/tokens").respond(200, json={"token": "t", "expires": "2999-01-01T00:00:00Z"})
+    mock.get(f"{NPM_API}/schema").mock(
+        side_effect=[httpx.Response(200, json={"letsencrypt_email": {}}), httpx.Response(200, json={"dns_challenge": {}})]
+    )
+    c = client()
+    assert await c.legacy_letsencrypt_meta() is True
+    assert await c.legacy_letsencrypt_meta() is False

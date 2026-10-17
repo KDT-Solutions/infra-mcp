@@ -91,9 +91,43 @@ async def _log_tail(endpoint_id: int, container: str, lines: int = LOG_TAIL_REPO
         return [f"(Logs nicht lesbar: {exc})"]
 
 
-async def _proxy_hosts_for(names: set[str]) -> list[dict[str, Any]]:
-    wanted = {n.lower() for n in names if n}
-    return [h for h in await npm().proxy_hosts() if str(h.get("forward_host") or "").lower() in wanted]
+def _published_ports(c: dict[str, Any]) -> set[int]:
+    return {int(p["PublicPort"]) for p in c.get("Ports") or [] if p.get("PublicPort")}
+
+
+def _host_points_to(h: dict[str, Any], names: set[str], ports: set[int]) -> bool:
+    """Proxy-Host zeigt auf einen der Container: per Containername/Dienstname oder
+    per DOCKER_HOST_IP + veröffentlichtem Host-Port."""
+    target = str(h.get("forward_host") or "").lower()
+    if target in names:
+        return True
+    host_ip = settings().docker_host_ip.lower()
+    return bool(host_ip) and target == host_ip and h.get("forward_port") in ports
+
+
+async def _proxy_hosts_for_containers(containers: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    names = {_container_name(c).lower() for c in containers} | {
+        str((c.get("Labels") or {}).get("com.docker.compose.service", "")).lower() for c in containers
+    }
+    names.discard("")
+    ports: set[int] = set()
+    for c in containers:
+        ports |= _published_ports(c)
+    return [h for h in await npm().proxy_hosts() if _host_points_to(h, names, ports)]
+
+
+async def _used_host_ports(endpoint_id: int) -> dict[int, str]:
+    """Belegte Host-Ports: von mcp sichtbare Container plus Ziele der NPM-Proxy-Hosts auf
+    DOCKER_HOST_IP (deckt auch Container ab, die mcp in Portainer nicht sieht)."""
+    used: dict[int, str] = {}
+    for c in await portainer().containers(endpoint_id, True):
+        for port in _published_ports(c):
+            used[port] = f"Container {_container_name(c)}"
+    host_ip = settings().docker_host_ip.lower()
+    for h in await npm().proxy_hosts():
+        if str(h.get("forward_host") or "").lower() == host_ip and h.get("forward_port"):
+            used.setdefault(int(h["forward_port"]), f"NPM-Proxy-Host {', '.join(h.get('domain_names') or [])}")
+    return used
 
 
 def _network_hint(network: str, service: str) -> str:
@@ -124,10 +158,11 @@ async def infra_publish_service(
     confirm: bool = False,
 ) -> dict[str, Any]:
     """Neuen Dienst komplett veröffentlichen:
-    1. Prüfen: Stack-Name und Domain frei, Domain löst auf PUBLIC_IP auf, Compose gültig,
-       Dienst hängt im NPM-Netz (NPM_DOCKER_NETWORK).
+    1. Prüfen: Stack-Name und Domain frei, Domain löst auf PUBLIC_IP auf, Compose gültig.
+       Mit DOCKER_HOST_IP: der Dienst veröffentlicht forward_port (Container-Port) auf einem
+       freien Host-Port. Ohne DOCKER_HOST_IP: der Dienst hängt im NPM-Netz (NPM_DOCKER_NETWORK).
     2. Stack anlegen und warten, bis der Container läuft (healthy, falls Healthcheck), max. 120 s.
-    3. Forward-Ziel = Containername im gemeinsamen Netz mit NPM (wird nach dem Start geprüft).
+    3. Forward-Ziel = DOCKER_HOST_IP:<Host-Port> bzw. Containername im NPM-Netz (nach dem Start geprüft).
     4. Proxy-Host mit Let's-Encrypt-Zertifikat anlegen, ssl_forced setzen.
     5. HTTPS-Abruf testen (Statuscode, Zertifikat gültig).
     service: Name des Compose-Dienstes, nötig wenn die Datei mehrere Dienste hat.
@@ -135,8 +170,9 @@ async def infra_publish_service(
     Ohne confirm=true nur Prüfung und Vorschau.
     """
     cfg = settings()
-    if not cfg.npm_docker_network:
-        raise GuardError("NPM_DOCKER_NETWORK ist nicht gesetzt (Docker-Netz, in dem NPM hängt).")
+    host_mode = bool(cfg.docker_host_ip)
+    if not host_mode and not cfg.npm_docker_network:
+        raise GuardError("Weder DOCKER_HOST_IP noch NPM_DOCKER_NETWORK ist gesetzt - Forward-Ziel nicht bestimmbar.")
     if not cfg.public_ip:
         raise GuardError("PUBLIC_IP ist nicht gesetzt.")
     guard.require_protected_domains_configured()
@@ -161,20 +197,48 @@ async def infra_publish_service(
         service = services[0]
     if service not in doc["services"]:
         raise GuardError(f"Dienst '{service}' nicht in der Compose-Datei (vorhanden: {services}).")
-    if cfg.npm_docker_network not in guard.compose_service_networks(doc, service):
-        raise GuardError("Abbruch vor dem Anlegen. " + _network_hint(cfg.npm_docker_network, service))
     expected_name = (doc["services"][service] or {}).get("container_name") or f"{stack_name}-{service}-1"
     pairs = env_pairs(env)
+    host_port = None
+    if host_mode:
+        mapping = guard.compose_published_port(doc, service, port, env)
+        if not mapping:
+            raise GuardError(
+                f"Abbruch vor dem Anlegen. Dienst '{service}' veröffentlicht Container-Port {port} nicht auf dem Host. "
+                f'In der Compose-Datei ergänzen: ports: ["<freier Host-Port>:{port}"]'
+            )
+        bind, host_port = mapping
+        if bind not in ("", "0.0.0.0", cfg.docker_host_ip):
+            raise GuardError(
+                f"Abbruch vor dem Anlegen. Port {host_port} ist an {bind} gebunden; NPM erreicht ihn über "
+                f"{cfg.docker_host_ip} nur mit Bind-Adresse 0.0.0.0 oder {cfg.docker_host_ip}."
+            )
+        used = await _used_host_ports(eid)
+        if host_port in used:
+            free = next(p for p in range(host_port + 1, 65536) if p not in used)
+            raise GuardError(
+                f"Abbruch vor dem Anlegen. Host-Port {host_port} ist belegt ({used[host_port]}). "
+                f"Nächster freier Port laut Prüfung: {free}."
+            )
+        forward_host, forward_port_npm = cfg.docker_host_ip, host_port
+    else:
+        if cfg.npm_docker_network not in guard.compose_service_networks(doc, service):
+            raise GuardError("Abbruch vor dem Anlegen. " + _network_hint(cfg.npm_docker_network, service))
+        forward_host, forward_port_npm = expected_name, port
 
     plan = {
         "stack": {"name": stack_name, "endpoint_id": eid, "services": services, "env_names": [p["name"] for p in pairs]},
         "service": service,
-        "forward": f"{scheme}://{expected_name}:{port}",
+        "forward": f"{scheme}://{forward_host}:{forward_port_npm}",
         "domain": d,
         "dns": dns["domains"][d],
-        "npm_network": cfg.npm_docker_network,
         "compose": guard.redact_compose(compose_content),
     }
+    if host_mode:
+        plan["host_port"] = {"port": host_port, "free": True,
+                             "checked": "von mcp sichtbare Container und NPM-Ziele auf DOCKER_HOST_IP"}
+    else:
+        plan["npm_network"] = cfg.npm_docker_network
     if not guard.is_confirmed(confirm):
         return guard.preview("publish_service", plan=plan)
 
@@ -212,15 +276,27 @@ async def infra_publish_service(
         return fail("wait_running", wait["reason"], done, logs=await _log_tail(eid, cname))
     done.append("container_running")
 
-    # 3. Forward-Ziel im NPM-Netz
-    data = await portainer().container_inspect(eid, cname)
-    networks = list(((data.get("NetworkSettings") or {}).get("Networks") or {}).keys())
-    if cfg.npm_docker_network not in networks:
-        return fail("network_check", _network_hint(cfg.npm_docker_network, service), done, container_networks=networks)
+    # 3. Forward-Ziel prüfen
+    if host_mode:
+        if host_port not in _published_ports(container):
+            refreshed = await _find_service_container(eid, stack_name, service) or container
+            if host_port not in _published_ports(refreshed):
+                return fail(
+                    "port_check", f"Container veröffentlicht Host-Port {host_port} nicht.", done,
+                    published_ports=sorted(_published_ports(refreshed)),
+                )
+    else:
+        data = await portainer().container_inspect(eid, cname)
+        networks = list(((data.get("NetworkSettings") or {}).get("Networks") or {}).keys())
+        if cfg.npm_docker_network not in networks:
+            return fail("network_check", _network_hint(cfg.npm_docker_network, service), done, container_networks=networks)
+        forward_host = cname
 
     # 4. Proxy-Host mit Zertifikat
     try:
-        payload = await build_create_payload([d], scheme, cname, port, websocket, True, True, True, False, None, None)
+        payload = await build_create_payload(
+            [d], scheme, forward_host, forward_port_npm, websocket, True, True, True, False, None, None
+        )
         result = await create_proxy_host_with_ssl(payload, True, True, False)
     except (NpmError, UnclearStateError, GuardError) as exc:
         state = await find_hosts_by_domain([d])
@@ -265,8 +341,7 @@ async def infra_update_service(stack_name: str, confirm: bool = False) -> dict[s
     await _block_protected_stack(stack)
     eid = stack["EndpointId"]
     before = await stack_containers(eid, stack["Name"])
-    names = {_container_name(c) for c in before} | {(c.get("Labels") or {}).get("com.docker.compose.service", "") for c in before}
-    hosts = await _proxy_hosts_for(names)
+    hosts = await _proxy_hosts_for_containers(before)
     domains = [dom for h in hosts for dom in h.get("domain_names") or []]
     info = {
         "stack": stack_summary(stack),
@@ -299,12 +374,20 @@ async def _locate_by_domain(domain: str) -> tuple[dict[str, Any] | None, list[di
     if not hosts:
         raise NpmError(f"Kein Proxy-Host für '{domain}' gefunden.")
     target = str(hosts[0].get("forward_host") or "")
+    by_port = bool(settings().docker_host_ip) and target.lower() == settings().docker_host_ip.lower()
     for ep in await portainer().endpoints():
-        for c in await portainer().containers(ep["Id"], True, {"name": [target]}):
-            if _container_name(c) == target:
-                project = (c.get("Labels") or {}).get("com.docker.compose.project")
-                stack = await find_stack_by_name(project) if project else None
-                return stack, hosts, {**c, "_endpoint_id": ep["Id"]}
+        if by_port:
+            port = hosts[0].get("forward_port")
+            candidates = [c for c in await portainer().containers(ep["Id"], True) if port in _published_ports(c)]
+        else:
+            candidates = [
+                c for c in await portainer().containers(ep["Id"], True, {"name": [target]}) if _container_name(c) == target
+            ]
+        if candidates:
+            c = candidates[0]
+            project = (c.get("Labels") or {}).get("com.docker.compose.project")
+            stack = await find_stack_by_name(project) if project else None
+            return stack, hosts, {**c, "_endpoint_id": ep["Id"]}
     return None, hosts, None
 
 
@@ -325,7 +408,10 @@ async def infra_service_status(stack_name_or_domain: str) -> dict[str, Any]:
             eid = single["_endpoint_id"]
             containers = [single]
         if not single:
-            out["warning"] = f"Forward-Ziel '{hosts[0].get('forward_host')}' ist kein sichtbarer Container."
+            out["warning"] = (
+                f"Forward-Ziel {hosts[0].get('forward_host')}:{hosts[0].get('forward_port')} gehört zu keinem "
+                "für mcp sichtbaren Container (evtl. anderer Host oder Stack nicht für mcp freigegeben)."
+            )
     else:
         name = guard.validate_stack_name(target)
         stack = await find_stack_by_name(name)
@@ -335,10 +421,7 @@ async def infra_service_status(stack_name_or_domain: str) -> dict[str, Any]:
         eid = stack.get("EndpointId") or eid
         containers = await stack_containers(eid, stack["Name"])
         if not hosts:
-            names = {_container_name(c) for c in containers} | {
-                (c.get("Labels") or {}).get("com.docker.compose.service", "") for c in containers
-            }
-            hosts = await _proxy_hosts_for(names)
+            hosts = await _proxy_hosts_for_containers(containers)
     out["stack"] = stack_summary(stack) if stack else None
 
     cont_out = []
