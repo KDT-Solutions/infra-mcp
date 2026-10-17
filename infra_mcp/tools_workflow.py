@@ -355,6 +355,15 @@ async def infra_update_service(stack_name: str, confirm: bool = False) -> dict[s
     report["redeploy"] = await redeploy_stack(stack, pull_image=True)
     after = await stack_containers(eid, stack["Name"])
     cnames = [_container_name(c) for c in after]
+    old = {_container_name(c): c for c in before}
+    report["images"] = {
+        _container_name(c): {
+            "image_id_before": (old.get(_container_name(c)) or {}).get("ImageID", "")[7:19] or None,
+            "image_id_after": (c.get("ImageID") or "")[7:19] or None,
+            "container_recreated": (old.get(_container_name(c)) or {}).get("Id") != c.get("Id"),
+        }
+        for c in after
+    }
     wait = await wait_until_running(eid, cnames) if cnames else {"ok": False, "reason": "Keine Container gefunden", "containers": {}}
     report["wait"] = wait
     report["logs"] = {c: await _log_tail(eid, c) for c in cnames}

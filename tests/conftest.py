@@ -52,6 +52,7 @@ def fast_polling(monkeypatch):
     from infra_mcp import tools_portainer, tools_workflow
 
     monkeypatch.setattr(tools_portainer, "WAIT_POLL_SECONDS", 0)
+    monkeypatch.setattr(tools_portainer, "STACK_DEPLOY_POLL_SECONDS", 0)
     monkeypatch.setattr(tools_workflow, "CONTAINER_POLL_SECONDS", 0)
     monkeypatch.setattr(tools_workflow, "CONTAINER_APPEAR_SECONDS", 0.5)
 

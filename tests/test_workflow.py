@@ -298,7 +298,11 @@ def update_env(npm_login, net):
     m.get(CONTAINER).respond(200, json=inspected(health="healthy"))
     m.get(f"{NPM_API}/nginx/proxy-hosts").respond(200, json=[host()])
     m.get(f"{PORTAINER_API}/stacks/77/file").respond(200, json={"StackFileContent": COMPOSE})
-    m.put(f"{PORTAINER_API}/stacks/77").respond(200, json={"Id": 77})
+    m.put(f"{PORTAINER_API}/stacks/77").respond(200, json={"Id": 77, "Status": 3})
+    m.get(f"{PORTAINER_API}/stacks/77").mock(side_effect=[
+        httpx.Response(200, json={"Id": 77, "Status": 3}),
+        httpx.Response(200, json={"Id": 77, "Status": 1}),
+    ])
     m.get(f"{PORTAINER_API}/endpoints/1/docker/containers/app-web-1/logs").respond(200, content=b"started\n")
     m.get(f"{PORTAINER_API}/endpoints/1/docker/containers/abcabcabcabc0001/json").respond(200, json=inspected(health="healthy"))
     return m
@@ -348,3 +352,46 @@ def test_version_without_tag_is_dev_hash(monkeypatch):
     monkeypatch.delenv("APP_VERSION", raising=False)
     monkeypatch.setenv("GIT_SHA", "fedcba9876543210")
     assert tools_workflow.infra_version()["version"] == "dev-fedcba9"
+
+
+async def test_update_waits_for_async_deploy_and_reports_new_image(update_env):
+    """Portainer rollt asynchron aus: erst Status 3, dann 1. Danach neuer Container mit neuem Image."""
+    new = listed()
+    new[0].update({"Id": "fffffffffffff0002", "ImageID": "sha256:7eb4245115615c4e"})
+    old = listed()
+    old[0]["ImageID"] = "sha256:1ed72bc493c4ef42"
+    # Aufrufe: Schutzprüfung, Stand vorher, Stand nachher
+    update_env.get(CONTAINER_LIST).mock(
+        side_effect=[httpx.Response(200, json=old), httpx.Response(200, json=old), httpx.Response(200, json=new)]
+    )
+    out = await tools_workflow.infra_update_service("app", confirm=True)
+    assert out["redeploy"]["stack_status"] == "active"
+    img = out["images"]["app-web-1"]
+    assert img == {"image_id_before": "1ed72bc493c4", "image_id_after": "7eb424511561", "container_recreated": True}
+    polls = [c for c in update_env.calls if c.request.method == "GET" and c.request.url.path == "/api/stacks/77"]
+    assert len(polls) == 2
+
+
+async def test_update_reports_portainer_deploy_error(update_env):
+    from infra_mcp.errors import PortainerError
+
+    update_env.get(f"{PORTAINER_API}/stacks/77").respond(
+        200, json={"Id": 77, "Status": 4, "DeploymentStatus": [{"Status": 4, "Message": "pull access denied for x"}]}
+    )
+    with pytest.raises(PortainerError, match="pull access denied"):
+        await tools_workflow.infra_update_service("app", confirm=True)
+
+
+async def test_update_deploy_timeout_is_unclear(update_env, monkeypatch):
+    from infra_mcp import tools_portainer
+    from infra_mcp.errors import UnclearStateError
+
+    update_env.get(f"{PORTAINER_API}/stacks/77").respond(200, json={"Id": 77, "Status": 3})
+    original = tools_portainer.wait_for_stack_deploy
+
+    async def short(stack_id, timeout=0.05):
+        return await original(stack_id, timeout=0.05)
+
+    monkeypatch.setattr(tools_portainer, "wait_for_stack_deploy", short)
+    with pytest.raises(UnclearStateError, match="deploying"):
+        await tools_workflow.infra_update_service("app", confirm=True)

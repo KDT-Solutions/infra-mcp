@@ -25,7 +25,9 @@ DEPLOY_TIMEOUT = 300.0
 CONTAINER_ACTION_TIMEOUT = 60.0
 
 STACK_TYPES = {1: "swarm", 2: "compose", 3: "kubernetes"}
-STACK_STATUS = {1: "active", 2: "inactive"}
+STACK_STATUS = {1: "active", 2: "inactive", 3: "deploying", 4: "error"}
+STACK_STATUS_DEPLOYING = 3
+STACK_STATUS_ERROR = 4
 
 
 def _error_message(resp: httpx.Response) -> str:

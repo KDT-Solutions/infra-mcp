@@ -10,13 +10,22 @@ from typing import Any
 
 from . import guard
 from .app import portainer, tool
-from .errors import GuardError, PortainerError
-from .portainer_client import STACK_STATUS, STACK_TYPES, demux_docker_stream, summarize_stats
+from .errors import GuardError, PortainerError, UnclearStateError
+from .portainer_client import (
+    DEPLOY_TIMEOUT,
+    STACK_STATUS,
+    STACK_STATUS_DEPLOYING,
+    STACK_STATUS_ERROR,
+    STACK_TYPES,
+    demux_docker_stream,
+    summarize_stats,
+)
 
 LOG_TAIL_MAX = 5000
 LOG_OUTPUT_MAX_CHARS = 60_000
 WAIT_RUNNING_SECONDS = 120
 WAIT_POLL_SECONDS = 3.0
+STACK_DEPLOY_POLL_SECONDS = 2.0
 
 
 # ---------------------------------------------------------------------------
@@ -428,6 +437,29 @@ async def portainer_container_action(endpoint_id: int, container: str, action: s
     }
 
 
+async def wait_for_stack_deploy(stack_id: int, timeout: float = DEPLOY_TIMEOUT) -> dict[str, Any]:
+    """Portainer (ab 2.4x) rollt Compose- und Git-Stacks nach PUT asynchron aus: der Request kehrt
+    sofort zurück, der Stack steht auf Status 3 (deploying) und wechselt danach auf 1 (active)
+    oder 4 (error, Meldung in DeploymentStatus). Hier wird auf das Ende gewartet."""
+    deadline = time.monotonic() + timeout
+    while True:
+        stack = await portainer().stack(stack_id)
+        status = stack.get("Status")
+        if status != STACK_STATUS_DEPLOYING:
+            break
+        if time.monotonic() >= deadline:
+            raise UnclearStateError(
+                f"Stack {stack_id} steht nach {int(timeout)} s noch auf 'deploying'. Zustand unklar - bitte "
+                "zuerst den Ist-Zustand prüfen (portainer_stack_list, portainer_container_list)."
+            )
+        await asyncio.sleep(STACK_DEPLOY_POLL_SECONDS)
+    if status == STACK_STATUS_ERROR:
+        history = stack.get("DeploymentStatus") or []
+        message = next((h.get("Message") for h in reversed(history) if h.get("Message")), "") or "keine Meldung"
+        raise PortainerError(f"Portainer: Deploy von Stack {stack_id} fehlgeschlagen: {guard.redact_text(message)[:500]}")
+    return {"status": STACK_STATUS.get(status, status)}
+
+
 async def redeploy_stack(stack: dict[str, Any], pull_image: bool) -> dict[str, Any]:
     """Compose-Stack: PUT /stacks/{id} mit bestehendem StackFileContent und Env.
     Git-Stack: PUT /stacks/{id}/git/redeploy. Immer prune=false."""
@@ -440,7 +472,8 @@ async def redeploy_stack(stack: dict[str, Any], pull_image: bool) -> dict[str, A
             "RepullImageAndRedeploy": pull,
         }
         await portainer().stack_git_redeploy(sid, eid, payload)
-        return {"method": "git_redeploy", "pull_image": pull, "prune": False}
+        done = await wait_for_stack_deploy(sid)
+        return {"method": "git_redeploy", "pull_image": pull, "prune": False, "stack_status": done["status"]}
     content = await portainer().stack_file(sid)
     if not content:
         raise PortainerError(f"Stack {sid}: Compose-Datei konnte nicht gelesen werden, Redeploy abgebrochen.")
@@ -453,7 +486,8 @@ async def redeploy_stack(stack: dict[str, Any], pull_image: bool) -> dict[str, A
         "RepullImageAndRedeploy": pull,
     }
     await portainer().stack_update_compose(sid, eid, payload)
-    return {"method": "compose_update", "pull_image": pull, "prune": False}
+    done = await wait_for_stack_deploy(sid)
+    return {"method": "compose_update", "pull_image": pull, "prune": False, "stack_status": done["status"]}
 
 
 def _require_compose_type(stack: dict[str, Any]) -> None:
