@@ -9,6 +9,7 @@ Hauptfälle:
 - neue Dienste (z.B. weitere MCP-Server) komplett veröffentlichen: Stack, Proxy-Host, Let's-Encrypt-Zertifikat, HTTPS-Test
 - Updates nach einem neuen ghcr-Image ausrollen
 - Fehler anhand von Logs und Status analysieren
+- Ressourcen des Docker-Hosts abfragen (CPU, RAM, Disk) inkl. 24-h-Verlauf von CPU und RAM
 
 Dieses Repo ist **öffentlich**: Code, README, Tests und Beispiele enthalten keine echten Hostnamen, IPs, Zugangsdaten oder Firmendaten - nur Platzhalter wie `portainer.example.com`, `npm.example.com`, `app.example.com` oder `203.0.113.10`. Echte Werte gehören ausschliesslich in die Stack-Variablen in Portainer.
 
@@ -25,6 +26,7 @@ Dieses Repo ist **öffentlich**: Code, README, Tests und Beispiele enthalten kei
 | `infra_mcp/tools_workflow.py` | `infra_*`-Tools (kombinierte Abläufe) |
 | `infra_mcp/guard.py` | Schutzlisten, confirm-Logik, Schwärzung, Compose-Prüfung |
 | `infra_mcp/netcheck.py` | DNS-Vorabprüfung, HTTPS-Test |
+| `infra_mcp/metrics.py` | Host-Ressourcen über node-exporter, 24-h-Verlauf |
 | `infra_mcp/config.py`, `version.py`, `audit.py` | Env-Konfiguration, Version, JSON-Audit-Log |
 
 Python, `mcp` (MCPServer, die FastMCP-API des offiziellen SDK 2.x), nur HTTP. Kein `pyproject.toml`, keine Paketierung: Abhängigkeiten gepinnt in `requirements.txt`, Start im Dockerfile per `python -m infra_mcp`.
@@ -83,6 +85,16 @@ Alle schreibenden Tools führen nur mit `confirm=true` aus. Ohne `confirm` liefe
 | `infra_publish_service(stack_name, endpoint_id, compose_content, domain, forward_port, env, websocket=false, service, forward_scheme="http", allow_docker_socket=false, confirm)` | 1. Prüft Stack-Name und Domain frei, DNS auf `PUBLIC_IP`, Compose gültig, Dienst im NPM-Netz. 2. Legt den Stack an und wartet max. 120 s auf running (bzw. healthy, falls Healthcheck). 3. Forward-Ziel = Containername im gemeinsamen Netz mit NPM (nach dem Start geprüft). 4. Proxy-Host mit Zertifikat. 5. HTTPS-Test (Statuscode, Zertifikat gültig). Bei Fehlern wird nichts zurückgebaut; die Antwort nennt `created`, `missing` und `failed_step` |
 | `infra_update_service(stack_name, confirm)` | Images pullen, Stack redeployen, warten bis running/healthy, danach letzte Log-Zeilen und HTTPS-Test der zugehörigen Domain(s) |
 | `infra_service_status(stack_name_or_domain)` | Stack, Container-Status, Health, letzte Fehler im Log, Proxy-Host, Zertifikatsablauf, DNS, HTTPS-Test |
+| `infra_host_resources` | Docker-Host jetzt: CPU-% (über 1 s gemessen), Kerne, Load, RAM, Swap, Belegung jedes Dateisystems (`warning` ab 85 %), Uptime |
+| `infra_host_history(hours=24, bucket_minutes=60)` | Verlauf von Host-CPU und -RAM: Durchschnitt, Maximum mit Zeitpunkt, Werte pro Zeitfenster, Lücken in der Aufzeichnung |
+
+### Host-Ressourcen
+
+Im Stack läuft neben infra-mcp ein [node-exporter](https://github.com/prometheus/node_exporter) (`quay.io/prometheus/node-exporter:v1.12.1`). Er liest `/proc` und die Dateisysteme des Hosts über einen read-only-Mount von `/` und ist nur im stack-internen Netz erreichbar (kein veröffentlichter Port, kein Zugang über NPM). infra-mcp selbst bekommt weiterhin weder Host-Mounts noch den Docker-Socket.
+
+infra-mcp fragt den node-exporter alle `METRICS_INTERVAL` Sekunden (Standard 60) ab und speichert CPU-%, RAM-% und Load für 24 h im Volume `infra-mcp-data` (`/data/host-metrics.jsonl`). Der Verlauf übersteht Neustarts und Redeploys. Ist die Datei nicht beschreibbar, läuft die Aufzeichnung nur im Speicher weiter (`persisted: false`). Pausen, z.B. durch einen Neustart, erscheinen in `infra_host_history` als `gaps`.
+
+CPU-% = Anteil der CPU-Zeit ausser `idle` und `iowait`, über alle Kerne. RAM belegt = `MemTotal - MemAvailable`. Disk belegt wie `df` (Grösse minus für Benutzer verfügbar); flüchtige Dateisysteme (tmpfs, overlay usw.) und Docker-interne Mounts sind ausgeblendet.
 
 `service` bei `infra_publish_service` ist nur nötig, wenn die Compose-Datei mehrere Dienste hat. Der Dienst muss im Docker-Netz von NPM hängen, z.B.:
 
@@ -123,6 +135,9 @@ DNS-Einträge legt infra-mcp nicht an. Fehlt einer, meldet das Tool den nötigen
 | `PROTECTED_STACKS` | nein | - | wie oben, gleiche Standardmuster |
 | `PROTECTED_DOMAINS` | für NPM-Schreibtools | - | mindestens die Domains von Portainer, NPM und infra-mcp |
 | `MCP_API_KEY` | ja | - | statisches Bearer-Token für den Connector. Ohne startet der Server nicht |
+| `NODE_EXPORTER_URL` | für Host-Ressourcen | in der Compose-Datei `http://infra-mcp-node-exporter:9100/metrics` | leer = Host-Tools und Aufzeichnung aus |
+| `METRICS_INTERVAL` | nein | `60` | Messintervall in Sekunden (min. 10) |
+| `METRICS_FILE` | nein | `/data/host-metrics.jsonl` | Datei für den 24-h-Verlauf |
 | `MCP_HOST_PORT` | nein | `8426` | Host-Port (gebunden an `127.0.0.1`) |
 | `LOG_LEVEL` | nein | `INFO` | |
 
@@ -132,6 +147,7 @@ Secrets nur über Env bzw. Portainer-Stack-Variablen, nie im Image.
 
 - Jeder HTTP-Request braucht `Authorization: Bearer <MCP_API_KEY>`, sonst `401 unauthorized` - auch `/healthz`. Gleicher Mechanismus wie plesk-mcp, also-mcp und dr-mcp (Konstantzeit-Vergleich, CORS für Claude.ai).
 - Kein Docker-Socket. Der Container läuft als Non-Root-User (UID 10001) mit Docker-`HEALTHCHECK`.
+- Der node-exporter mountet `/` des Hosts read-only und kann damit alle Dateien des Hosts lesen. Er liefert nur Metriken, hat keinen veröffentlichten Port und hängt nur im internen Netz (`internal: true`, kein Zugang nach aussen). Den Stack deshalb als Administrator anlegen; ein Nicht-Administrator darf in Portainer je nach Einstellung keine Bind-Mounts nutzen.
 - Fehlerantworten enthalten keine Passwörter, Tokens oder Header. Bekannte Secret-Werte werden zusätzlich aus allen Texten entfernt.
 - Container-Env wird nur mit Namen ausgegeben, Stack-Env ebenso; Compose-Dateien und `advanced_config` nur geschwärzt.
 - Jeder Tool-Aufruf wird als JSON-Zeile auf stdout geloggt: Toolname, Parameter ohne Secrets (Env nur Namen, Compose nur Länge), Resultat-Kurzfassung, Dauer.
@@ -170,6 +186,7 @@ Zusätzlich: Zwei-Faktor-Anmeldung für diesen Benutzer aus, und ab NPM v2.13 mu
 |---|---|
 | Portainer | API-Pfade und Payloads gegen den Quellcode **2.45.2** geprüft. Noch nicht gegen eine laufende Instanz getestet |
 | Nginx Proxy Manager | Payloads gegen den Quellcode **v2.16.0** geprüft (Let's-Encrypt-Altformat gegen v2.12.6). Noch nicht gegen eine laufende Instanz getestet |
+| node-exporter | v1.12.1 (Standardausschlüsse für Dateisysteme gegen den Quellcode geprüft) |
 | Python / SDK | Python 3.12 (Image), `mcp==2.3.0` |
 
 Die Tests laufen mit gemockten APIs. Nach dem ersten Einsatz hier die tatsächlich eingesetzten Versionen eintragen.
@@ -192,7 +209,7 @@ Ohne `APP_VERSION` meldet `infra_version` die Version `dev-<kurzer Commit>`.
 ## Deployment
 
 1. In Portainer und NPM die Benutzer mit den Rechten oben anlegen, Portainer-Access-Token für `mcp` erzeugen.
-2. In Portainer einen neuen Stack aus `docker-compose.yml` anlegen (Repository oder Web-Editor) und die Variablen setzen (siehe `.env.example`), mindestens `PORTAINER_URL`, `PORTAINER_API_KEY`, `NPM_URL`, `NPM_USER`, `NPM_PASSWORD`, `NPM_DOCKER_NETWORK`, `PUBLIC_IP`, `PROTECTED_DOMAINS`, `MCP_API_KEY` (z.B. `openssl rand -hex 32`).
+2. In Portainer **als Administrator** einen neuen Stack aus `docker-compose.yml` anlegen (Repository oder Web-Editor) und die Variablen setzen (siehe `.env.example`), mindestens `PORTAINER_URL`, `PORTAINER_API_KEY`, `NPM_URL`, `NPM_USER`, `NPM_PASSWORD`, `NPM_DOCKER_NETWORK`, `PUBLIC_IP`, `PROTECTED_DOMAINS`, `MCP_API_KEY` (z.B. `openssl rand -hex 32`).
 3. Der Stack hängt im Docker-Netz von NPM (`NPM_DOCKER_NETWORK`), dadurch ist die NPM-API intern unter `http://<npm-container>:81/api` erreichbar. Port 81 bleibt nicht öffentlich.
 4. DNS: A-Record für die Subdomain von infra-mcp (z.B. `infra-mcp.example.com`) auf die öffentliche IP.
 5. In NPM einen Proxy-Host anlegen: Domain `infra-mcp.example.com` -> `http://infra-mcp:8000`, Let's-Encrypt-Zertifikat, Force SSL. Diese Domain in `PROTECTED_DOMAINS` aufnehmen.
@@ -213,4 +230,4 @@ pip install -r requirements-dev.txt
 pytest -q
 ```
 
-Abgedeckt: Log-Demux, Schwärzung, NPM-Token-Erneuerung und 401-Wiederholung, Schutzlisten, Duplikat-Prüfung, DNS-Vorabprüfung, confirm-Logik, Compose-Prüfung, Bearer-Auth, Audit-Log und der Ablauf von `infra_publish_service` mit Fehlern in jedem Schritt.
+Abgedeckt: Host-Metriken und 24-h-Verlauf, Log-Demux, Schwärzung, NPM-Token-Erneuerung und 401-Wiederholung, Schutzlisten, Duplikat-Prüfung, DNS-Vorabprüfung, confirm-Logik, Compose-Prüfung, Bearer-Auth, Audit-Log und der Ablauf von `infra_publish_service` mit Fehlern in jedem Schritt.

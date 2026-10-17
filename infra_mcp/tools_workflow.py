@@ -9,7 +9,7 @@ from __future__ import annotations
 import asyncio
 from typing import Any
 
-from . import guard, netcheck
+from . import guard, metrics, netcheck
 from .app import npm, portainer, tool
 from .config import settings
 from .errors import GuardError, InfraError, NpmError, PortainerError, UnclearStateError
@@ -43,6 +43,25 @@ CONTAINER_POLL_SECONDS = 3.0
 def infra_version() -> dict[str, str]:
     """Version des laufenden infra-mcp (APP_VERSION aus dem Git-Tag), Commit und Build-Zeit."""
     return version_info()
+
+
+@tool()
+async def infra_host_resources() -> dict[str, Any]:
+    """Aktuelle Ressourcen des Docker-Hosts (über den node-exporter im Stack):
+    CPU-% (über 1 s gemessen), Kerne, Load, RAM, Swap, Belegung der Dateisysteme
+    (warning ab 85 %), Uptime."""
+    return await metrics.current_resources()
+
+
+@tool()
+def infra_host_history(hours: float = 24, bucket_minutes: int = 60) -> dict[str, Any]:
+    """Verlauf von Host-CPU und -RAM (max. 24 h), von infra-mcp selbst alle
+    METRICS_INTERVAL Sekunden aufgezeichnet: Durchschnitt, Maximum mit Zeitpunkt,
+    Werte pro Zeitfenster (bucket_minutes) und Lücken in der Aufzeichnung."""
+    if not settings().node_exporter_url:
+        raise metrics.MetricsError("NODE_EXPORTER_URL ist nicht gesetzt - es wird nichts aufgezeichnet.")
+    h = max(0.1, min(float(hours), 24.0))
+    return metrics.history().summary(h, max(1, min(int(bucket_minutes), 1440)))
 
 
 # ---------------------------------------------------------------------------

@@ -25,17 +25,47 @@ services:
       - PROTECTED_STACKS=${PROTECTED_STACKS:-}
       - PROTECTED_DOMAINS=${PROTECTED_DOMAINS}
       - MCP_API_KEY=${MCP_API_KEY}
+      # Host-Ressourcen über den node-exporter unten (infra_host_resources/-history)
+      - NODE_EXPORTER_URL=${NODE_EXPORTER_URL:-http://infra-mcp-node-exporter:9100/metrics}
+      - METRICS_INTERVAL=${METRICS_INTERVAL:-60}
+      - METRICS_FILE=/data/host-metrics.jsonl
       - MCP_HOST=0.0.0.0
       - MCP_PORT=8000
     # Kein Docker-Socket: infra-mcp spricht nur mit der Portainer- und der NPM-API.
+    volumes:
+      # 24-h-Verlauf von Host-CPU/RAM, übersteht Neustarts und Redeploys
+      - infra-mcp-data:/data
+    depends_on:
+      - node-exporter
     networks:
       - npm
+      - internal
     ports:
       # Nur auf localhost gebunden. Öffentlich erreichbar ist der Dienst über
       # NPM (Proxy-Host -> http://infra-mcp:8000), das im selben Docker-Netz hängt.
       - "${MCP_BIND_ADDR:-127.0.0.1}:${MCP_HOST_PORT:-8426}:8000"
 
+  node-exporter:
+    # Liest CPU, RAM, Load und Dateisysteme des Docker-Hosts (alles read-only).
+    # Kein veröffentlichter Port, nur im stack-internen Netz erreichbar -
+    # weder NPM noch das Internet sehen ihn. infra-mcp selbst bekommt keine Host-Mounts.
+    image: quay.io/prometheus/node-exporter:v1.12.1
+    container_name: infra-mcp-node-exporter
+    restart: unless-stopped
+    command:
+      - "--path.rootfs=/host"
+    volumes:
+      - "/:/host:ro,rslave"
+    networks:
+      - internal
+
+volumes:
+  infra-mcp-data:
+
 networks:
+  # Nur zwischen infra-mcp und node-exporter, ohne Zugang nach aussen
+  internal:
+    internal: true
   # Bestehendes Docker-Netz von NPM. Darüber erreicht infra-mcp die NPM-API
   # intern (NPM_URL=http://<npm-container>:81/api) - Port 81 bleibt nicht öffentlich.
   npm:

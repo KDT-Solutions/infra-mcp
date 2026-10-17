@@ -9,6 +9,7 @@ bekommt 401 (auch /healthz).
 
 from __future__ import annotations
 
+import asyncio
 import hmac
 import logging
 import os
@@ -16,7 +17,9 @@ import sys
 
 # Registrierung der Tools passiert beim Import der Module.
 from . import tools_npm, tools_portainer, tools_workflow  # noqa: F401
+from . import metrics
 from .app import mcp
+from .config import settings
 from .version import __version__
 
 logging.basicConfig(
@@ -106,7 +109,15 @@ async def _run_http_server(api_key: str, host: str, port: int) -> None:
     config = uvicorn.Config(app, host=host, port=port, log_level="info")
     srv = uvicorn.Server(config)
     logger.info("infra-mcp %s HTTP server running on %s:%s", __version__, host, port)
-    await srv.serve()
+    sampler = None
+    if settings().node_exporter_url:
+        # 24-h-Verlauf von Host-CPU/RAM (infra_host_history)
+        sampler = asyncio.create_task(metrics.sampler_loop())
+    try:
+        await srv.serve()
+    finally:
+        if sampler:
+            sampler.cancel()
 
 
 def main() -> None:
@@ -115,8 +126,6 @@ def main() -> None:
         raise RuntimeError(
             "MCP_API_KEY (statisches Bearer-Token) fehlt - aus Sicherheitsgründen kein Start ohne Token."
         )
-    import asyncio
-
     host = os.environ.get("MCP_HOST", "0.0.0.0")
     port = int(os.environ.get("MCP_PORT", "8000"))
     asyncio.run(_run_http_server(api_key, host, port))

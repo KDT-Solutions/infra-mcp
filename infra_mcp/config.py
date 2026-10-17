@@ -21,6 +21,13 @@ def _bool(value: str | None, default: bool) -> bool:
     return value.strip().lower() in ("1", "true", "yes", "on")
 
 
+def _int(value: str | None, default: int) -> int:
+    try:
+        return int(value) if value not in (None, "") else default
+    except ValueError:
+        return default
+
+
 def _list(value: str | None) -> tuple[str, ...]:
     if not value:
         return ()
@@ -50,6 +57,9 @@ class Settings:
     protected_stacks: tuple[str, ...]
     protected_domains: tuple[str, ...]
     mcp_api_key: str
+    node_exporter_url: str = ""
+    metrics_interval: int = 60
+    metrics_file: str = ""
 
     def secret_values(self) -> tuple[str, ...]:
         """Werte, die in keiner Ausgabe und keinem Log auftauchen dürfen."""
@@ -72,6 +82,9 @@ def load_settings() -> Settings:
         protected_stacks=_merge(DEFAULT_PROTECTED_STACKS, _list(env.get("PROTECTED_STACKS"))),
         protected_domains=_list(env.get("PROTECTED_DOMAINS")),
         mcp_api_key=env.get("MCP_API_KEY", ""),
+        node_exporter_url=env.get("NODE_EXPORTER_URL", "").strip(),
+        metrics_interval=max(10, _int(env.get("METRICS_INTERVAL"), 60)),
+        metrics_file=env.get("METRICS_FILE", "").strip(),
     )
 
 
