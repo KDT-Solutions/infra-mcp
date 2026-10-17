@@ -1,0 +1,43 @@
+services:
+  infra-mcp:
+    # Fertiges Image aus der GitHub Container Registry - wird per GitHub Actions
+    # bei jedem Git-Tag vX.Y.Z gebaut (.github/workflows/docker-publish.yml).
+    # Statt :latest kann eine feste Version (z.B. :0.1.0) eingetragen werden.
+    # Ist das Package auf ghcr.io privat, braucht Portainer unter "Registries"
+    # einen ghcr.io-Eintrag mit einem GitHub-Token (Scope "read:packages").
+    image: ghcr.io/kdt-solutions/infra-mcp:latest
+    # Bei jedem Deploy/Redeploy das Image neu ziehen statt einer evtl.
+    # veralteten lokalen :latest-Kopie.
+    pull_policy: always
+    container_name: infra-mcp
+    restart: unless-stopped
+    environment:
+      - PORTAINER_URL=${PORTAINER_URL}
+      - PORTAINER_API_KEY=${PORTAINER_API_KEY}
+      - PORTAINER_TLS_VERIFY=${PORTAINER_TLS_VERIFY:-1}
+      - NPM_URL=${NPM_URL}
+      - NPM_USER=${NPM_USER}
+      - NPM_PASSWORD=${NPM_PASSWORD}
+      - NPM_DEFAULT_EMAIL=${NPM_DEFAULT_EMAIL:-}
+      - NPM_DOCKER_NETWORK=${NPM_DOCKER_NETWORK}
+      - PUBLIC_IP=${PUBLIC_IP}
+      - PROTECTED_CONTAINERS=${PROTECTED_CONTAINERS:-}
+      - PROTECTED_STACKS=${PROTECTED_STACKS:-}
+      - PROTECTED_DOMAINS=${PROTECTED_DOMAINS}
+      - MCP_API_KEY=${MCP_API_KEY}
+      - MCP_HOST=0.0.0.0
+      - MCP_PORT=8000
+    # Kein Docker-Socket: infra-mcp spricht nur mit der Portainer- und der NPM-API.
+    networks:
+      - npm
+    ports:
+      # Nur auf localhost gebunden. Öffentlich erreichbar ist der Dienst über
+      # NPM (Proxy-Host -> http://infra-mcp:8000), das im selben Docker-Netz hängt.
+      - "${MCP_BIND_ADDR:-127.0.0.1}:${MCP_HOST_PORT:-8426}:8000"
+
+networks:
+  # Bestehendes Docker-Netz von NPM. Darüber erreicht infra-mcp die NPM-API
+  # intern (NPM_URL=http://<npm-container>:81/api) - Port 81 bleibt nicht öffentlich.
+  npm:
+    external: true
+    name: ${NPM_DOCKER_NETWORK}

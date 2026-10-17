@@ -1,0 +1,91 @@
+"""Konfiguration ausschliesslich über Umgebungsvariablen (siehe README).
+
+Secrets (PORTAINER_API_KEY, NPM_PASSWORD, MCP_API_KEY) kommen nur aus der
+Umgebung bzw. den Portainer-Stack-Variablen und werden nie ins Image gebaut.
+"""
+
+from __future__ import annotations
+
+import os
+from dataclasses import dataclass
+
+# Diese Muster gelten immer, zusätzlich zu den Werten aus PROTECTED_CONTAINERS /
+# PROTECTED_STACKS. Ein gesetzter Env-Wert kann sie also nicht versehentlich aufheben.
+DEFAULT_PROTECTED_CONTAINERS = ("portainer*", "nginx-proxy-manager*", "npm*", "infra-mcp*")
+DEFAULT_PROTECTED_STACKS = ("portainer*", "nginx-proxy-manager*", "npm*", "infra-mcp*")
+
+
+def _bool(value: str | None, default: bool) -> bool:
+    if value is None or value.strip() == "":
+        return default
+    return value.strip().lower() in ("1", "true", "yes", "on")
+
+
+def _list(value: str | None) -> tuple[str, ...]:
+    if not value:
+        return ()
+    return tuple(p.strip().lower() for p in value.split(",") if p.strip())
+
+
+def _merge(defaults: tuple[str, ...], extra: tuple[str, ...]) -> tuple[str, ...]:
+    out: list[str] = []
+    for p in (*defaults, *extra):
+        if p not in out:
+            out.append(p)
+    return tuple(out)
+
+
+@dataclass(frozen=True)
+class Settings:
+    portainer_url: str
+    portainer_api_key: str
+    portainer_tls_verify: bool
+    npm_url: str
+    npm_user: str
+    npm_password: str
+    npm_default_email: str
+    npm_docker_network: str
+    public_ip: str
+    protected_containers: tuple[str, ...]
+    protected_stacks: tuple[str, ...]
+    protected_domains: tuple[str, ...]
+    mcp_api_key: str
+
+    def secret_values(self) -> tuple[str, ...]:
+        """Werte, die in keiner Ausgabe und keinem Log auftauchen dürfen."""
+        return tuple(v for v in (self.portainer_api_key, self.npm_password, self.mcp_api_key) if v and len(v) >= 4)
+
+
+def load_settings() -> Settings:
+    env = os.environ
+    return Settings(
+        portainer_url=env.get("PORTAINER_URL", "").strip().rstrip("/"),
+        portainer_api_key=env.get("PORTAINER_API_KEY", "").strip(),
+        portainer_tls_verify=_bool(env.get("PORTAINER_TLS_VERIFY"), True),
+        npm_url=env.get("NPM_URL", "").strip().rstrip("/"),
+        npm_user=env.get("NPM_USER", "").strip(),
+        npm_password=env.get("NPM_PASSWORD", ""),
+        npm_default_email=env.get("NPM_DEFAULT_EMAIL", "").strip(),
+        npm_docker_network=env.get("NPM_DOCKER_NETWORK", "").strip(),
+        public_ip=env.get("PUBLIC_IP", "").strip(),
+        protected_containers=_merge(DEFAULT_PROTECTED_CONTAINERS, _list(env.get("PROTECTED_CONTAINERS"))),
+        protected_stacks=_merge(DEFAULT_PROTECTED_STACKS, _list(env.get("PROTECTED_STACKS"))),
+        protected_domains=_list(env.get("PROTECTED_DOMAINS")),
+        mcp_api_key=env.get("MCP_API_KEY", ""),
+    )
+
+
+_settings: Settings | None = None
+
+
+def settings() -> Settings:
+    global _settings
+    if _settings is None:
+        _settings = load_settings()
+    return _settings
+
+
+def reset() -> None:
+    """Nur für Tests: Konfiguration beim nächsten Zugriff neu aus der Umgebung lesen."""
+    global _settings
+    _settings = None
