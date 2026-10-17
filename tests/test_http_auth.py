@@ -101,3 +101,13 @@ async def test_tool_list_has_prefixes(server):
     names = [t.name for t in await mcp.list_tools()]
     assert all(n.startswith(("portainer_", "npm_", "infra_")) for n in names)
     assert len(names) == 35
+
+
+def test_version_file_format():
+    """VERSION bestimmt den Tag, den GitHub Actions beim Push auf main setzt."""
+    import os
+    import re
+
+    path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "VERSION")
+    with open(path, encoding="utf-8") as f:
+        assert re.fullmatch(r"\d+\.\d+\.\d+", f.read().strip())

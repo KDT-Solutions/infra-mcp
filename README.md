@@ -197,18 +197,21 @@ Zusätzlich: Zwei-Faktor-Anmeldung für diesen Benutzer aus, und ab NPM v2.13 mu
 
 Die automatischen Tests laufen mit gemockten APIs. Schreibende Tools sind gegen die laufenden Instanzen noch nicht ausgeführt worden.
 
-## Release (nur über Git-Tags)
+## Release (über Git-Tags, automatisch gesetzt)
+
+Die Version steht in der Datei `VERSION` (z.B. `0.2.1`). Für ein Release diese Datei erhöhen und auf `main` pushen:
 
 ```bash
-git tag v0.1.0
-git push origin v0.1.0
+echo 0.2.2 > VERSION
+git commit -am "Release 0.2.2" && git push
 ```
 
-GitHub Actions (`.github/workflows/docker-publish.yml`) führt zuerst die Tests aus und baut nur bei grünen Tests das Image:
+GitHub Actions (`.github/workflows/docker-publish.yml`) führt zuerst die Tests aus. Sind sie grün und gibt es den Tag `v<VERSION>` noch nicht, setzt der Workflow den Tag selbst und baut `ghcr.io/kdt-solutions/infra-mcp:<VERSION>` und `:latest` mit den Build-Args `APP_VERSION`, `GIT_SHA`, `BUILD_TIME`.
 
-- Tag `vX.Y.Z` -> `ghcr.io/kdt-solutions/infra-mcp:X.Y.Z` und `:latest`, Build-Args `APP_VERSION=X.Y.Z`, `GIT_SHA`, `BUILD_TIME`
-- manueller Lauf (*Run workflow*) -> nur `:dev-<kurzer Commit>`, `APP_VERSION=dev-<kurzer Commit>`
-- Push ohne Tag und Pull Requests -> nur Tests
+- Push ohne Änderung an `VERSION` (Tag existiert schon) -> nur Tests, kein Image
+- Tag `vX.Y.Z` von Hand gesetzt -> ebenfalls `:X.Y.Z` und `:latest`
+- manueller Lauf (*Run workflow*) -> nur `:dev-<kurzer Commit>`
+- Pull Requests -> nur Tests
 
 Ohne `APP_VERSION` meldet `infra_version` die Version `dev-<kurzer Commit>`.
 
