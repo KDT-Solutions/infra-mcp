@@ -41,9 +41,11 @@ services:
       - npm
       - internal
     ports:
-      # Nur auf localhost gebunden. Öffentlich erreichbar ist der Dienst über
-      # NPM (Proxy-Host -> http://infra-mcp:8000), das im selben Docker-Netz hängt.
-      - "${MCP_BIND_ADDR:-127.0.0.1}:${MCP_HOST_PORT:-8426}:8000"
+      # Auf allen Interfaces gebunden (wie die übrigen MCP-Stacks), damit NPM
+      # den Dienst auch über <Host-IP>:8426 erreicht. Die Zugriffskontrolle ist
+      # das zwingende MCP_API_KEY-Bearer-Token, TLS macht NPM. Alternativ
+      # leitet NPM über das gemeinsame Docker-Netz direkt auf infra-mcp:8000.
+      - "${MCP_BIND_ADDR:-0.0.0.0}:${MCP_HOST_PORT:-8426}:8000"
 
   node-exporter:
     # Liest CPU, RAM, Load und Dateisysteme des Docker-Hosts (alles read-only).
