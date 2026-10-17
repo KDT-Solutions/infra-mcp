@@ -61,6 +61,7 @@ class Settings:
     metrics_interval: int = 60
     metrics_file: str = ""
     docker_host_ip: str = ""
+    git_allowed_repo_prefixes: tuple[str, ...] = ()
 
     def secret_values(self) -> tuple[str, ...]:
         """Werte, die in keiner Ausgabe und keinem Log auftauchen dürfen."""
@@ -87,6 +88,9 @@ def load_settings() -> Settings:
         metrics_interval=max(10, _int(env.get("METRICS_INTERVAL"), 60)),
         metrics_file=env.get("METRICS_FILE", "").strip(),
         docker_host_ip=env.get("DOCKER_HOST_IP", "").strip(),
+        git_allowed_repo_prefixes=tuple(
+            p.strip().rstrip("/").lower() + "/" for p in env.get("GIT_ALLOWED_REPO_PREFIXES", "").split(",") if p.strip()
+        ),
     )
 
 

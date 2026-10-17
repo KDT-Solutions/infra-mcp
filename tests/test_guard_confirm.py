@@ -547,3 +547,123 @@ async def test_stack_update_refuses_workflow_stack(mock):
     with pytest.raises(GuardError, match="Git"):
         await tools_portainer.portainer_stack_update(13, compose_content="services:\n  a:\n    image: x\n", confirm=True)
     assert put.call_count == 0
+
+
+# ---------------------------------------------------------------------------
+# portainer_stack_create_git
+# ---------------------------------------------------------------------------
+
+GIT_COMPOSE = (
+    "services:\n  app:\n    image: ghcr.io/example/app:latest\n    environment:\n"
+    "      - API_KEY=${API_KEY}\n      - BASE_URL=${BASE_URL:-https://api.example.com}\n"
+    "    ports:\n      - \"${MCP_HOST_PORT:-8424}:8000\"\n"
+)
+RAW = "https://raw.githubusercontent.com/example-org/app-mcp/main/docker-compose.yml"
+
+
+@pytest.fixture
+def gitmock(mock):
+    mock.get(f"{PORTAINER_API}/stacks").respond(200, json=[])
+    mock.get(RAW).respond(200, text=GIT_COMPOSE)
+    create = mock.post(f"{PORTAINER_API}/stacks/create/standalone/repository").respond(200, json={"Id": 55})
+    mock.get(f"{PORTAINER_API}/stacks/55").respond(200, json={"Id": 55, "Name": "app-mcp", "Type": 2, "Status": 1, "WorkflowID": 9})
+    return create
+
+
+async def test_create_git_preview_and_execute(gitmock):
+    args = dict(name="app-mcp", endpoint_id=3, repository_url="https://github.com/example-org/app-mcp",
+                env={"API_KEY": "geheimer-key-123", "MCP_HOST_PORT": "8424"})
+    prev = await tools_portainer.portainer_stack_create_git(**args)
+    assert prev["preview"] is True and gitmock.call_count == 0
+    assert prev["env_missing_without_default"] == []
+    assert "geheimer-key-123" not in json.dumps(prev)
+    out = await tools_portainer.portainer_stack_create_git(**args, confirm=True)
+    body = json.loads(gitmock.calls.last.request.read())
+    assert body["RepositoryURL"] == "https://github.com/example-org/app-mcp"
+    assert body["RepositoryReferenceName"] == "refs/heads/main" and body["ComposeFile"] == "docker-compose.yml"
+    assert body["RepositoryAuthentication"] is False and "AutoUpdate" not in body
+    assert {"name": "API_KEY", "value": "geheimer-key-123"} in body["Env"]
+    assert gitmock.calls.last.request.url.params["endpointId"] == "3"
+    assert out["stack_id"] == 55 and out["stack_status"] == "active"
+    assert "geheimer-key-123" not in json.dumps(out)
+
+
+async def test_create_git_reports_missing_env(gitmock):
+    prev = await tools_portainer.portainer_stack_create_git(
+        name="app-mcp", endpoint_id=3, repository_url="https://github.com/example-org/app-mcp.git"
+    )
+    assert prev["env_missing_without_default"] == ["API_KEY"]
+
+
+async def test_create_git_auto_update(gitmock):
+    await tools_portainer.portainer_stack_create_git(
+        name="app-mcp", endpoint_id=3, repository_url="https://github.com/example-org/app-mcp",
+        env={"API_KEY": "x"}, auto_update_interval="5m", confirm=True,
+    )
+    body = json.loads(gitmock.calls.last.request.read())
+    assert body["AutoUpdate"] == {"Interval": "5m", "ForcePullImage": True, "ForceUpdate": False}
+
+
+async def test_create_git_rejects_unsafe_compose_from_repo(mock):
+    mock.get(f"{PORTAINER_API}/stacks").respond(200, json=[])
+    mock.get(RAW).respond(200, text="services:\n  a:\n    image: x\n    privileged: true\n")
+    create = mock.post(f"{PORTAINER_API}/stacks/create/standalone/repository").respond(200, json={"Id": 1})
+    with pytest.raises(GuardError, match="privileged"):
+        await tools_portainer.portainer_stack_create_git(
+            name="app-mcp", endpoint_id=3, repository_url="https://github.com/example-org/app-mcp", confirm=True
+        )
+    assert create.call_count == 0
+
+
+@pytest.mark.parametrize("url", [
+    "http://github.com/example-org/app",
+    "https://gitlab.com/example-org/app",
+    "https://github.com/example-org",
+    "https://github.com/example-org/app/../../x",
+    "git@github.com:example-org/app.git",
+])
+async def test_create_git_rejects_bad_urls(mock, url):
+    with pytest.raises(GuardError):
+        await tools_portainer.portainer_stack_create_git(name="app-mcp", endpoint_id=3, repository_url=url)
+
+
+@pytest.mark.parametrize("ref,path", [("main", "docker-compose.yml"), ("refs/heads/main", "../x.yml"), ("refs/heads/main", "/etc/x")])
+async def test_create_git_rejects_bad_ref_or_path(mock, ref, path):
+    with pytest.raises(GuardError):
+        await tools_portainer.portainer_stack_create_git(
+            name="app-mcp", endpoint_id=3, repository_url="https://github.com/example-org/app", reference=ref, compose_path=path
+        )
+
+
+async def test_create_git_allowed_prefixes(mock, monkeypatch):
+    monkeypatch.setenv("GIT_ALLOWED_REPO_PREFIXES", "https://github.com/example-org")
+    config.reset()
+    with pytest.raises(GuardError, match="GIT_ALLOWED_REPO_PREFIXES"):
+        await tools_portainer.portainer_stack_create_git(
+            name="app-mcp", endpoint_id=3, repository_url="https://github.com/other-org/app"
+        )
+
+
+async def test_create_git_private_or_missing_file(mock):
+    mock.get(f"{PORTAINER_API}/stacks").respond(200, json=[])
+    mock.get(RAW).respond(404, text="404: Not Found")
+    with pytest.raises(GuardError, match="privat"):
+        await tools_portainer.portainer_stack_create_git(
+            name="app-mcp", endpoint_id=3, repository_url="https://github.com/example-org/app-mcp"
+        )
+
+
+async def test_create_git_deploy_error(mock):
+    mock.get(f"{PORTAINER_API}/stacks").respond(200, json=[])
+    mock.get(RAW).respond(200, text=GIT_COMPOSE)
+    mock.post(f"{PORTAINER_API}/stacks/create/standalone/repository").respond(200, json={"Id": 56})
+    mock.get(f"{PORTAINER_API}/stacks/56").respond(
+        200, json={"Id": 56, "Status": 4, "DeploymentStatus": [{"Message": "port is already allocated"}]}
+    )
+    from infra_mcp.errors import PortainerError
+
+    with pytest.raises(PortainerError, match="already allocated"):
+        await tools_portainer.portainer_stack_create_git(
+            name="app-mcp", endpoint_id=3, repository_url="https://github.com/example-org/app-mcp",
+            env={"API_KEY": "x"}, confirm=True,
+        )

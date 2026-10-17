@@ -9,7 +9,7 @@ import re
 import time
 from typing import Any
 
-from . import guard
+from . import gitsource, guard
 from .app import portainer, tool
 from .errors import GuardError, PortainerError, UnclearStateError
 from .portainer_client import (
@@ -622,6 +622,78 @@ async def portainer_stack_create(
     out = {"executed": True, "action": "stack_create", "stack_id": stack_id, **details}
     if stack_id:
         # Asynchrones Deploy abwarten, damit ein Fehler von Portainer sichtbar wird
+        done = await wait_for_stack_deploy(int(stack_id))
+        out["stack_status"] = done["status"]
+    return out
+
+
+@tool()
+async def portainer_stack_create_git(
+    name: str,
+    endpoint_id: int,
+    repository_url: str,
+    reference: str = "refs/heads/main",
+    compose_path: str = "docker-compose.yml",
+    env: dict[str, str] | None = None,
+    auto_update_interval: str | None = None,
+    force_pull_image: bool = True,
+    allow_docker_socket: bool = False,
+    confirm: bool = False,
+) -> dict[str, Any]:
+    """Neuen Compose-Stack aus einem Git-Repository anlegen (Portainer "Repository").
+
+    repository_url: öffentliches GitHub-Repository (https://github.com/<owner>/<repo>).
+    reference: refs/heads/<branch> oder refs/tags/<tag>. compose_path: Pfad der Compose-Datei.
+    Die Compose-Datei wird vorher aus dem Repository geladen und gleich geprüft wie bei
+    portainer_stack_create. env: {NAME: wert}, die Vorschau zeigt nur die Namen.
+    auto_update_interval: optional GitOps-Polling, z.B. "5m"; force_pull_image zieht dabei
+    das Image neu. Wartet auf das Deploy und meldet die Fehlermeldung von Portainer.
+    Ohne confirm=true nur Prüfung und Vorschau."""
+    n = guard.validate_stack_name(name)
+    guard.block(guard.stack_protection(n))
+    eid = guard.validate_positive_id(endpoint_id, "endpoint_id")
+    url, owner, repo, ref, path = gitsource.validate_repo(repository_url, reference, compose_path)
+    interval = (auto_update_interval or "").strip()
+    if interval and not re.fullmatch(r"\d+[smh]", interval):
+        raise GuardError("auto_update_interval muss z.B. '5m', '1h' oder '30s' sein.")
+    if await find_stack_by_name(n):
+        raise GuardError(f"Stack-Name '{n}' ist bereits vergeben.")
+    content = await gitsource.fetch_compose(owner, repo, ref, path)
+    doc = guard.validate_compose(content, allow_docker_socket)
+    pairs = env_pairs(env)
+    referenced = sorted(set(re.findall(r"\$\{([A-Za-z_][A-Za-z0-9_]*)(?::?-[^}]*)?\}", content)))
+    required = sorted(set(re.findall(r"\$\{([A-Za-z_][A-Za-z0-9_]*)\}", content)))
+    given = {p["name"] for p in pairs}
+    details = {
+        "name": n,
+        "endpoint_id": eid,
+        "repository_url": url,
+        "reference": ref,
+        "compose_path": path,
+        "services": list(doc["services"].keys()),
+        "env_names": [p["name"] for p in pairs],
+        "env_missing_without_default": [v for v in required if v not in given],
+        "env_unused": sorted(given - set(referenced)),
+        "auto_update": {"interval": interval, "force_pull_image": bool(force_pull_image)} if interval else None,
+        "compose": guard.redact_compose(content),
+    }
+    if not guard.is_confirmed(confirm):
+        return guard.preview("stack_create_git", **details)
+    payload: dict[str, Any] = {
+        "Name": n,
+        "RepositoryURL": url,
+        "RepositoryReferenceName": ref,
+        "RepositoryAuthentication": False,
+        "ComposeFile": path,
+        "Env": pairs,
+    }
+    if interval:
+        payload["AutoUpdate"] = {"Interval": interval, "ForcePullImage": bool(force_pull_image), "ForceUpdate": False}
+    created = await portainer().stack_create_git(eid, payload)
+    details.pop("compose")
+    stack_id = (created or {}).get("Id")
+    out = {"executed": True, "action": "stack_create_git", "stack_id": stack_id, **details}
+    if stack_id:
         done = await wait_for_stack_deploy(int(stack_id))
         out["stack_status"] = done["status"]
     return out

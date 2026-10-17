@@ -256,6 +256,16 @@ class PortainerClient:
             timeout=DEPLOY_TIMEOUT, write=True,
         )
 
+    async def stack_create_git(self, endpoint_id: int, payload: dict[str, Any]) -> Any:
+        return await self._request(
+            "POST",
+            "/stacks/create/standalone/repository",
+            params={"endpointId": int(endpoint_id)},
+            json_body=payload,
+            timeout=DEPLOY_TIMEOUT,
+            write=True,
+        )
+
     async def stack_create_compose(self, endpoint_id: int, name: str, content: str, env: list[dict[str, str]]) -> Any:
         return await self._request(
             "POST",

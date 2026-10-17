@@ -26,6 +26,7 @@ services:
       - PROTECTED_CONTAINERS=${PROTECTED_CONTAINERS:-}
       - PROTECTED_STACKS=${PROTECTED_STACKS:-}
       - PROTECTED_DOMAINS=${PROTECTED_DOMAINS}
+      - GIT_ALLOWED_REPO_PREFIXES=${GIT_ALLOWED_REPO_PREFIXES:-}
       - MCP_API_KEY=${MCP_API_KEY}
       # Host-Ressourcen über den node-exporter unten (infra_host_resources/-history)
       - NODE_EXPORTER_URL=${NODE_EXPORTER_URL:-http://infra-mcp-node-exporter:9100/metrics}

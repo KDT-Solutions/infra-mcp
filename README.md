@@ -57,6 +57,7 @@ Alle schreibenden Tools führen nur mit `confirm=true` aus. Ohne `confirm` liefe
 | `portainer_stack_redeploy(stack_id, pull_image=true, confirm)` | Compose: `PUT /api/stacks/{id}` mit bestehendem StackFileContent und Env, `PullImage`, `Prune=false`. Git: `PUT /api/stacks/{id}/git/redeploy` |
 | `portainer_stack_start` / `portainer_stack_stop(stack_id, confirm)` | Stack starten/stoppen (nichts wird gelöscht) |
 | `portainer_stack_create(name, endpoint_id, compose_content, env, allow_docker_socket=false, confirm)` | Neuer Compose-Stack. Vorher geprüft (siehe Compose-Prüfung), Name frei. Wartet auf das asynchrone Deploy und meldet die Fehlermeldung von Portainer |
+| `portainer_stack_create_git(name, endpoint_id, repository_url, reference="refs/heads/main", compose_path="docker-compose.yml", env, auto_update_interval, force_pull_image=true, allow_docker_socket=false, confirm)` | Neuer Git-Stack (Portainer "Repository", `POST /api/stacks/create/standalone/repository`). Nur öffentliche GitHub-Repositories: die Compose-Datei wird vorher über raw.githubusercontent.com geladen und wie bei `portainer_stack_create` geprüft. Vorschau zeigt Env-Namen, fehlende Variablen ohne Default und ungenutzte Variablen. Optional GitOps-Polling. Wartet auf das Deploy |
 | `portainer_stack_update(stack_id, compose_content, env_set, env_unset, pull_image=true, allow_docker_socket=false, confirm)` | Bestehenden Compose-Stack ändern und neu ausrollen (`Prune=false`). Compose-Datei ersetzen und/oder einzelne Env-Variablen setzen/entfernen; alle übrigen Env-Werte bleiben erhalten und laufen nicht durch den Chat. Vorschau mit geschwärztem Diff und den betroffenen Env-Namen. Nicht für Git-Stacks |
 
 ### Git-Stacks (Portainer ab 2.4x)
@@ -141,6 +142,9 @@ DNS-Einträge legt infra-mcp nicht an. Fehlt einer, meldet das Tool den nötigen
 - Ohne gesetztes `PROTECTED_DOMAINS` sind alle schreibenden NPM-Tools gesperrt.
 
 ## Umgebungsvariablen
+
+`GIT_ALLOWED_REPO_PREFIXES` (optional, kommagetrennt, z.B. `https://github.com/example-org`): Nur Repositories mit diesem Präfix dürfen als Git-Stack angelegt werden. Leer = jedes öffentliche GitHub-Repository.
+
 
 | Variable | Pflicht | Standard | Beschreibung |
 |---|---|---|---|
