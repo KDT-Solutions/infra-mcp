@@ -56,7 +56,20 @@ Alle schreibenden Tools führen nur mit `confirm=true` aus. Ohne `confirm` liefe
 | `portainer_container_action(endpoint_id, container, action, confirm)` | `start`, `stop`, `restart` |
 | `portainer_stack_redeploy(stack_id, pull_image=true, confirm)` | Compose: `PUT /api/stacks/{id}` mit bestehendem StackFileContent und Env, `PullImage`, `Prune=false`. Git: `PUT /api/stacks/{id}/git/redeploy` |
 | `portainer_stack_start` / `portainer_stack_stop(stack_id, confirm)` | Stack starten/stoppen (nichts wird gelöscht) |
-| `portainer_stack_create(name, endpoint_id, compose_content, env, allow_docker_socket=false, confirm)` | Neuer Compose-Stack. Vorher geprüft: YAML gültig, keine `privileged`-Container, kein Docker-Socket-Mount ohne `allow_docker_socket=true`, Name frei |
+| `portainer_stack_create(name, endpoint_id, compose_content, env, allow_docker_socket=false, confirm)` | Neuer Compose-Stack. Vorher geprüft (siehe Compose-Prüfung), Name frei. Wartet auf das asynchrone Deploy und meldet die Fehlermeldung von Portainer |
+| `portainer_stack_update(stack_id, compose_content, env_set, env_unset, pull_image=true, allow_docker_socket=false, confirm)` | Bestehenden Compose-Stack ändern und neu ausrollen (`Prune=false`). Compose-Datei ersetzen und/oder einzelne Env-Variablen setzen/entfernen; alle übrigen Env-Werte bleiben erhalten und laufen nicht durch den Chat. Vorschau mit geschwärztem Diff und den betroffenen Env-Namen. Nicht für Git-Stacks |
+
+### Compose-Prüfung
+
+Gilt für `portainer_stack_create`, `portainer_stack_update` und `infra_publish_service`. Blockiert wird alles, womit ein Container aus seiner Isolation ausbricht:
+
+- `privileged`, `cap_add`, `devices`
+- `security_opt` ausser `no-new-privileges` (also kein `seccomp:unconfined`, `apparmor:unconfined`, `label:disable` ...)
+- Host-Namespaces: `pid`, `ipc`, `uts`, `userns_mode`, `network_mode`, `cgroup` mit `host`
+- Bind-Mounts sensibler Host-Pfade (`/`, `/etc`, `/root`, `/boot`, `/proc`, `/sys`, `/dev`, `/usr`, `/bin`, `/sbin`, `/lib*`, `/var/lib/docker`, `/var/run`, `/run`) ausser read-only (`:ro`)
+- Docker-Socket-Mount ohne `allow_docker_socket=true`
+
+Hinweis: Portainer selbst lehnt `security_opt` für Nicht-Administratoren ab, solange das in den Sicherheitseinstellungen der Umgebung gesperrt ist. Empfohlen ist stattdessen `"no-new-privileges": true` in `/etc/docker/daemon.json` des Hosts - dann gilt der Schutz für alle Container, ohne dass ein Stack `security_opt` braucht.
 
 ### NPM - lesend
 

@@ -30,6 +30,7 @@ from .tools_portainer import (
     redeploy_stack,
     stack_containers,
     stack_summary,
+    wait_for_stack_deploy,
     wait_until_running,
 )
 from .version import version_info
@@ -265,6 +266,16 @@ async def infra_publish_service(
     stack_id = (created or {}).get("Id")
     report["created"].append({"stack": {"id": stack_id, "name": stack_name}})
     done.append("stack")
+
+    # Portainer rollt asynchron aus: Fehler (z.B. von Portainer abgelehnte Compose-Optionen)
+    # stehen erst danach im Stack-Status. Ohne diesen Schritt käme nur "Kein Container gefunden".
+    if stack_id:
+        try:
+            await wait_for_stack_deploy(int(stack_id))
+        except UnclearStateError as exc:
+            return fail("stack_deploy", str(exc), done, state="unklar")
+        except PortainerError as exc:
+            return fail("stack_deploy", str(exc), done)
 
     container = await _find_service_container(eid, stack_name, service)
     if not container:

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import datetime
+import difflib
 import re
 import time
 from typing import Any
@@ -592,4 +593,104 @@ async def portainer_stack_create(
         return guard.preview("stack_create", **details)
     created = await portainer().stack_create_compose(int(endpoint_id), name, compose_content, pairs)
     details.pop("compose")
-    return {"executed": True, "action": "stack_create", "stack_id": (created or {}).get("Id"), **details}
+    stack_id = (created or {}).get("Id")
+    out = {"executed": True, "action": "stack_create", "stack_id": stack_id, **details}
+    if stack_id:
+        # Asynchrones Deploy abwarten, damit ein Fehler von Portainer sichtbar wird
+        done = await wait_for_stack_deploy(int(stack_id))
+        out["stack_status"] = done["status"]
+    return out
+
+
+@tool()
+async def portainer_stack_update(
+    stack_id: int,
+    compose_content: str | None = None,
+    env_set: dict[str, str] | None = None,
+    env_unset: list[str] | None = None,
+    pull_image: bool = True,
+    allow_docker_socket: bool = False,
+    confirm: bool = False,
+) -> dict[str, Any]:
+    """Bestehenden Compose-Stack ändern und neu ausrollen (prune aus).
+
+    compose_content: neue Compose-Datei (leer lassen = bestehende behalten). Wird gleich
+    geprüft wie bei portainer_stack_create.
+    env_set: {NAME: wert} setzt oder ändert einzelne Variablen, env_unset: Namen entfernen.
+    Alle übrigen Env-Werte bleiben unverändert erhalten und laufen nicht durch den Chat -
+    Secrets daher möglichst direkt in Portainer pflegen und hier nur die Compose-Datei ändern.
+    Ohne confirm=true nur Vorschau mit Diff der Compose-Datei (geschwärzt) und den
+    betroffenen Env-Namen."""
+    stack = await _stack_checked(stack_id)
+    _require_compose_type(stack)
+    if stack.get("GitConfig"):
+        raise GuardError(
+            f"Stack '{stack.get('Name')}' wird aus Git ausgerollt; die Compose-Datei dort ändern und "
+            "portainer_stack_redeploy verwenden."
+        )
+    await _block_protected_stack(stack)
+    if compose_content is None and not env_set and not env_unset:
+        raise GuardError("Nichts zu ändern: compose_content, env_set oder env_unset angeben.")
+
+    sid, eid = stack["Id"], stack.get("EndpointId")
+    current = await portainer().stack_file(sid)
+    if not current:
+        raise PortainerError(f"Stack {sid}: Compose-Datei konnte nicht gelesen werden.")
+    new_content = current if compose_content is None or not compose_content.strip() else compose_content
+    guard.validate_compose(new_content, allow_docker_socket)
+
+    existing = [
+        {"name": str(e.get("name")), "value": "" if e.get("value") is None else str(e.get("value"))}
+        for e in (stack.get("Env") or []) if isinstance(e, dict) and e.get("name")
+    ]
+    names = [e["name"] for e in existing]
+    sets = env_pairs(env_set)
+    unset = [str(n).strip() for n in (env_unset or []) if str(n).strip()]
+    unknown = [n for n in unset if n not in names]
+    if unknown:
+        raise GuardError(f"env_unset: Variable(n) nicht im Stack vorhanden: {', '.join(unknown)}")
+    merged = [e for e in existing if e["name"] not in unset]
+    added, changed = [], []
+    for p in sets:
+        hit = next((e for e in merged if e["name"] == p["name"]), None)
+        if hit is None:
+            merged.append(p)
+            added.append(p["name"])
+        elif hit["value"] != p["value"]:
+            hit["value"] = p["value"]
+            changed.append(p["name"])
+
+    secrets = [e["value"] for e in merged + existing if e["value"] and len(e["value"]) >= 4 and guard.is_secret_name(e["name"])]
+    diff = "".join(
+        difflib.unified_diff(
+            guard.redact_compose(current).splitlines(keepends=True),
+            guard.redact_compose(new_content).splitlines(keepends=True),
+            "aktuell", "neu",
+        )
+    )
+    details = {
+        "stack": stack_summary(stack),
+        "compose_changed": new_content != current,
+        "compose_diff": guard.redact_text(diff, secrets) or None,
+        "env_added": added,
+        "env_changed": changed,
+        "env_removed": unset,
+        "pull_image": bool(pull_image),
+        "prune": False,
+    }
+    if not details["compose_changed"] and not (added or changed or unset):
+        raise GuardError("Keine Änderung gegenüber dem aktuellen Stand.")
+    if not guard.is_confirmed(confirm):
+        return guard.preview("stack_update", **details)
+    pull = bool(pull_image)
+    payload = {
+        "StackFileContent": new_content,
+        "Env": merged,
+        "Prune": False,
+        "PullImage": pull,
+        "RepullImageAndRedeploy": pull,
+    }
+    await portainer().stack_update_compose(sid, eid, payload)
+    done = await wait_for_stack_deploy(sid)
+    details.pop("compose_diff")
+    return {"executed": True, "action": "stack_update", **details, "stack_status": done["status"]}

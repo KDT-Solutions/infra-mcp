@@ -2,6 +2,8 @@
 
 import json
 
+import httpx
+
 import pytest
 from conftest import NPM_API, PORTAINER_API, PUBLIC_IP, written
 
@@ -196,13 +198,14 @@ async def test_stack_redeploy_git(mock):
 async def test_stack_create_preview_and_execute(mock):
     mock.get(f"{PORTAINER_API}/stacks").respond(200, json=[])
     create = mock.post(f"{PORTAINER_API}/stacks/create/standalone/string").respond(200, json={"Id": 21})
+    mock.get(f"{PORTAINER_API}/stacks/21").respond(200, json={"Id": 21, "Name": "web", "Type": 2, "EndpointId": 1, "Status": 1})
     compose = "services:\n  web:\n    image: nginx\n    environment:\n      - API_KEY=abc12345\n"
     prev = await tools_portainer.portainer_stack_create("web", 1, compose, env={"DB_PASSWORD": "pw-geheim"})
     assert prev["preview"] is True and create.call_count == 0
     assert "abc12345" not in json.dumps(prev) and "pw-geheim" not in json.dumps(prev)
     assert prev["env_names"] == ["DB_PASSWORD"]
     out = await tools_portainer.portainer_stack_create("web", 1, compose, env={"DB_PASSWORD": "pw-geheim"}, confirm=True)
-    assert out["stack_id"] == 21
+    assert out["stack_id"] == 21 and out["stack_status"] == "active"
     body = json.loads(create.calls.last.request.read())
     assert body == {"Name": "web", "StackFileContent": compose, "Env": [{"name": "DB_PASSWORD", "value": "pw-geheim"}]}
     assert create.calls.last.request.url.params["endpointId"] == "1"
@@ -377,3 +380,127 @@ def test_stack_name_validation(bad):
 def test_container_ref_validation(bad):
     with pytest.raises(GuardError):
         guard.validate_container_ref(bad)
+
+
+# ---------------------------------------------------------------------------
+# Strengere Compose-Prüfung
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("extra,match", [
+    ("    cap_add: [SYS_ADMIN]\n", "cap_add"),
+    ("    devices: ['/dev/sda:/dev/sda']\n", "devices"),
+    ("    security_opt: ['seccomp:unconfined']\n", "security_opt"),
+    ("    security_opt: ['apparmor:unconfined']\n", "security_opt"),
+    ("    pid: host\n", "pid"),
+    ("    network_mode: host\n", "network_mode"),
+    ("    userns_mode: host\n", "userns_mode"),
+    ("    volumes:\n      - /:/host\n", "read-only"),
+    ("    volumes:\n      - /etc:/hostetc:rw\n", "read-only"),
+    ("    volumes:\n      - type: bind\n        source: /var/lib/docker\n        target: /d\n", "read-only"),
+])
+def test_compose_escape_options_rejected(extra, match):
+    with pytest.raises(GuardError, match=match):
+        guard.validate_compose("services:\n  a:\n    image: x\n" + extra)
+
+
+@pytest.mark.parametrize("extra", [
+    "    security_opt: ['no-new-privileges:true']\n",
+    "    security_opt:\n      - no-new-privileges\n",
+    "    volumes:\n      - /:/host:ro,rslave\n",
+    "    volumes:\n      - /etc/localtime:/etc/localtime:ro\n",
+    "    volumes:\n      - /srv/app/data:/data\n",
+    "    volumes:\n      - appdata:/data\n",
+    "    network_mode: bridge\n",
+    "    cap_drop: [ALL]\n",
+])
+def test_compose_safe_options_allowed(extra):
+    assert guard.validate_compose("services:\n  a:\n    image: x\n" + extra)
+
+
+# ---------------------------------------------------------------------------
+# portainer_stack_update
+# ---------------------------------------------------------------------------
+
+OLD_COMPOSE = "services:\n  app:\n    image: x\n    security_opt:\n      - no-new-privileges:true\n"
+NEW_COMPOSE = "services:\n  app:\n    image: x\n"
+
+
+@pytest.fixture
+def upd(mock):
+    env = [{"name": "API_TOKEN", "value": "token-geheim-123"}, {"name": "MODE", "value": "a"}]
+    mock.get(f"{PORTAINER_API}/stacks/9").respond(
+        200, json={"Id": 9, "Name": "app", "Type": 2, "EndpointId": 2, "Env": env, "Status": 1}
+    )
+    mock.get(f"{PORTAINER_API}/endpoints/2/docker/containers/json").respond(200, json=[])
+    mock.get(f"{PORTAINER_API}/stacks/9/file").respond(200, json={"StackFileContent": OLD_COMPOSE})
+    put = mock.put(f"{PORTAINER_API}/stacks/9").respond(200, json={"Id": 9})
+    return put
+
+
+async def test_stack_update_preview_keeps_secrets_out(upd):
+    prev = await tools_portainer.portainer_stack_update(9, compose_content=NEW_COMPOSE, env_set={"MODE": "b", "NEW": "1"})
+    assert prev["preview"] is True and upd.call_count == 0
+    assert "-      - no-new-privileges:true" in prev["compose_diff"]
+    assert prev["env_added"] == ["NEW"] and prev["env_changed"] == ["MODE"]
+    assert "token-geheim-123" not in json.dumps(prev)
+
+
+async def test_stack_update_merges_env_and_keeps_existing(upd):
+    out = await tools_portainer.portainer_stack_update(
+        9, compose_content=NEW_COMPOSE, env_set={"MODE": "b"}, confirm=True
+    )
+    body = json.loads(upd.calls.last.request.read())
+    assert body["StackFileContent"] == NEW_COMPOSE
+    assert body["Env"] == [{"name": "API_TOKEN", "value": "token-geheim-123"}, {"name": "MODE", "value": "b"}]
+    assert body["Prune"] is False
+    assert out["stack_status"] == "active" and "token-geheim-123" not in json.dumps(out)
+
+
+async def test_stack_update_env_unset_and_unknown(upd):
+    with pytest.raises(GuardError, match="nicht im Stack"):
+        await tools_portainer.portainer_stack_update(9, env_unset=["GIBTSNICHT"], confirm=True)
+    await tools_portainer.portainer_stack_update(9, env_unset=["MODE"], confirm=True)
+    body = json.loads(upd.calls.last.request.read())
+    assert [e["name"] for e in body["Env"]] == ["API_TOKEN"]
+
+
+async def test_stack_update_rejects_unsafe_compose(upd):
+    with pytest.raises(GuardError, match="privileged"):
+        await tools_portainer.portainer_stack_update(9, compose_content=NEW_COMPOSE + "    privileged: true\n", confirm=True)
+    assert upd.call_count == 0
+
+
+async def test_stack_update_nothing_to_do(upd):
+    with pytest.raises(GuardError, match="Nichts zu ändern"):
+        await tools_portainer.portainer_stack_update(9)
+    with pytest.raises(GuardError, match="Keine Änderung"):
+        await tools_portainer.portainer_stack_update(9, compose_content=OLD_COMPOSE)
+
+
+async def test_stack_update_blocked_for_protected_stack(mock):
+    mock.get(f"{PORTAINER_API}/stacks/3").respond(200, json={"Id": 3, "Name": "core-db", "Type": 2, "EndpointId": 1})
+    with pytest.raises(GuardError):
+        await tools_portainer.portainer_stack_update(3, compose_content=NEW_COMPOSE, confirm=True)
+
+
+async def test_stack_update_git_stack_refused(mock):
+    mock.get(f"{PORTAINER_API}/stacks/10").respond(
+        200, json={"Id": 10, "Name": "gitapp", "Type": 2, "EndpointId": 1, "GitConfig": {"URL": "https://git.example.com/r.git"}}
+    )
+    with pytest.raises(GuardError, match="Git"):
+        await tools_portainer.portainer_stack_update(10, compose_content=NEW_COMPOSE)
+
+
+async def test_stack_update_reports_deploy_error(mock):
+    mock.get(f"{PORTAINER_API}/stacks/9").mock(side_effect=[
+        httpx.Response(200, json={"Id": 9, "Name": "app", "Type": 2, "EndpointId": 2, "Env": []}),
+        httpx.Response(200, json={"Id": 9, "Status": 4, "DeploymentStatus": [{"Message": "port is already allocated"}]}),
+    ])
+    mock.get(f"{PORTAINER_API}/endpoints/2/docker/containers/json").respond(200, json=[])
+    mock.get(f"{PORTAINER_API}/stacks/9/file").respond(200, json={"StackFileContent": OLD_COMPOSE})
+    mock.put(f"{PORTAINER_API}/stacks/9").respond(200, json={"Id": 9})
+    from infra_mcp.errors import PortainerError
+
+    with pytest.raises(PortainerError, match="already allocated"):
+        await tools_portainer.portainer_stack_update(9, compose_content=NEW_COMPOSE, confirm=True)

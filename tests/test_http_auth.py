@@ -100,7 +100,7 @@ async def test_tool_list_has_prefixes(server):
 
     names = [t.name for t in await mcp.list_tools()]
     assert all(n.startswith(("portainer_", "npm_", "infra_")) for n in names)
-    assert len(names) == 35
+    assert len(names) == 36
 
 
 def test_version_file_format():

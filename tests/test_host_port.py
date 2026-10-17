@@ -92,6 +92,7 @@ def happy(npm_login, host_mode):
     m.get(f"{NPM_API}/nginx/redirection-hosts").respond(200, json=[])
     m.get(CONTAINER_LIST).respond(200, json=[container(ports=(8427,), name="infra-mcp", project="infra-mcp")])
     m.post(f"{PORTAINER_API}/stacks/create/standalone/string").respond(200, json={"Id": 80})
+    m.get(f"{PORTAINER_API}/stacks/80").respond(200, json={"Id": 80, "Type": 2, "EndpointId": 1, "Status": 1})
     m.get(CONTAINER).respond(200, json={"Id": "abcabcabcabc0001", "Name": "/app-web-1", "State": {"Status": "running"},
                                         "Config": {"Tty": False}, "RestartCount": 0})
     m.post(f"{NPM_API}/nginx/proxy-hosts").respond(201, json={"id": 50})

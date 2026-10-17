@@ -308,9 +308,60 @@ def _volume_sources(service: dict[str, Any]) -> list[str]:
     return sources
 
 
+# security_opt: nur dieser Eintrag ist erlaubt. Alles andere (seccomp/apparmor
+# unconfined, label:disable, ...) würde Schutzmechanismen des Hosts aushebeln.
+ALLOWED_SECURITY_OPTS = {"no-new-privileges", "no-new-privileges:true", "no-new-privileges=true"}
+
+# Host-Namespaces bzw. -Zugriffe, die einen Container praktisch zum Host machen.
+_HOST_MODE_KEYS = ("pid", "ipc", "uts", "userns_mode", "network_mode", "cgroup")
+
+# Host-Pfade, die nur read-only eingebunden werden dürfen (Präfix-Vergleich).
+_SENSITIVE_HOST_PATHS = (
+    "/", "/etc", "/root", "/boot", "/proc", "/sys", "/dev", "/usr", "/bin", "/sbin", "/lib", "/lib64",
+    "/var/lib/docker", "/var/run", "/run",
+)
+
+
+def _volume_specs(service: dict[str, Any]) -> list[tuple[str, bool]]:
+    """(Host-Quelle, read_only) je Bind-Mount. Benannte Volumes werden ignoriert."""
+    out: list[tuple[str, bool]] = []
+    for vol in service.get("volumes") or []:
+        if isinstance(vol, str):
+            parts = vol.split(":")
+            src = parts[0]
+            mode = parts[2] if len(parts) >= 3 else ""
+            ro = "ro" in mode.split(",")
+        elif isinstance(vol, dict):
+            if vol.get("type", "bind") != "bind":
+                continue
+            src = vol.get("source")
+            ro = bool(vol.get("read_only"))
+        else:
+            continue
+        if isinstance(src, str) and src.startswith("/"):
+            out.append((src, ro))
+    return out
+
+
+def _is_sensitive_path(src: str) -> bool:
+    p = "/" + src.strip("/")
+    for s in _SENSITIVE_HOST_PATHS:
+        if s == "/":
+            if p == "/":
+                return True
+        elif p == s or p.startswith(s + "/"):
+            return True
+    return False
+
+
 def validate_compose(content: str, allow_docker_socket: bool = False) -> dict[str, Any]:
-    """Compose-Datei prüfen: YAML parsebar, services vorhanden, keine
-    privileged-Container, kein Docker-Socket-Mount ohne allow_docker_socket=true.
+    """Compose-Datei prüfen: YAML parsebar, services vorhanden und keine Optionen,
+    mit denen ein Container aus seiner Isolation ausbricht:
+    - kein privileged, kein cap_add, keine devices,
+    - security_opt nur no-new-privileges,
+    - keine Host-Namespaces (pid/ipc/uts/userns/network/cgroup: host),
+    - sensible Host-Pfade (/, /etc, /root, /var/lib/docker, ...) nur read-only,
+    - kein Docker-Socket-Mount ohne allow_docker_socket=true.
     Gibt das geparste Dokument zurück."""
     if not content or not content.strip():
         raise GuardError("compose_content ist leer.")
@@ -329,6 +380,26 @@ def validate_compose(content: str, allow_docker_socket: bool = False) -> dict[st
             continue
         if svc.get("privileged") in (True, "true", "True"):
             problems.append(f"Dienst '{name}': privileged ist nicht erlaubt.")
+        if svc.get("cap_add"):
+            problems.append(f"Dienst '{name}': cap_add ist nicht erlaubt.")
+        if svc.get("devices") or svc.get("device_cgroup_rules"):
+            problems.append(f"Dienst '{name}': devices ist nicht erlaubt.")
+        sec = svc.get("security_opt") or []
+        if isinstance(sec, str):
+            sec = [sec]
+        for opt in sec:
+            if str(opt).strip().lower() not in ALLOWED_SECURITY_OPTS:
+                problems.append(f"Dienst '{name}': security_opt '{opt}' ist nicht erlaubt (nur no-new-privileges).")
+        for key in _HOST_MODE_KEYS:
+            val = str(svc.get(key) or "").strip().lower()
+            if val == "host":
+                problems.append(f"Dienst '{name}': {key}: {svc.get(key)} ist nicht erlaubt.")
+        for src, ro in _volume_specs(svc):
+            is_socket = src.rstrip("/").endswith("docker.sock")
+            if is_socket:
+                continue
+            if _is_sensitive_path(src) and not ro:
+                problems.append(f"Dienst '{name}': Host-Pfad {src} nur read-only (':ro') erlaubt.")
         if not allow_docker_socket:
             for src in _volume_sources(svc):
                 if src.rstrip("/").endswith("docker.sock"):

@@ -73,6 +73,7 @@ def happy(npm_login, net):
     m.get(f"{NPM_API}/nginx/proxy-hosts").respond(200, json=[])
     m.get(f"{NPM_API}/nginx/redirection-hosts").respond(200, json=[])
     m.post(f"{PORTAINER_API}/stacks/create/standalone/string").respond(200, json={"Id": 77})
+    m.get(f"{PORTAINER_API}/stacks/77").respond(200, json={"Id": 77, "Name": "app", "Type": 2, "EndpointId": 1, "Status": 1})
     m.get(CONTAINER_LIST).respond(200, json=listed())
     m.get(CONTAINER).respond(200, json=inspected(health="healthy"))
     m.post(f"{NPM_API}/nginx/proxy-hosts").respond(201, json={"id": 50})
@@ -395,3 +396,14 @@ async def test_update_deploy_timeout_is_unclear(update_env, monkeypatch):
     monkeypatch.setattr(tools_portainer, "wait_for_stack_deploy", short)
     with pytest.raises(UnclearStateError, match="deploying"):
         await tools_workflow.infra_update_service("app", confirm=True)
+
+
+async def test_publish_reports_portainer_deploy_error(happy):
+    happy.get(f"{PORTAINER_API}/stacks/77").respond(200, json={
+        "Id": 77, "Name": "app", "Type": 2, "EndpointId": 1, "Status": 4,
+        "DeploymentStatus": [{"Status": 4, "Message": "security-opt setting disabled for non administrator users"}],
+    })
+    out = await publish(confirm=True)
+    assert out["failed_step"] == "stack_deploy"
+    assert "security-opt" in out["error"]
+    assert "container_running" in out["missing"]
