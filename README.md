@@ -58,11 +58,20 @@ Alle schreibenden Tools führen nur mit `confirm=true` aus. Ohne `confirm` liefe
 | `portainer_stack_start` / `portainer_stack_stop(stack_id, confirm)` | Stack starten/stoppen (nichts wird gelöscht) |
 | `portainer_stack_create(name, endpoint_id, compose_content, env, allow_docker_socket=false, confirm)` | Neuer Compose-Stack. Vorher geprüft (siehe Compose-Prüfung), Name frei. Wartet auf das asynchrone Deploy und meldet die Fehlermeldung von Portainer |
 | `portainer_stack_create_git(name, endpoint_id, repository_url, reference="refs/heads/main", compose_path="docker-compose.yml", env, auto_update_interval, force_pull_image=true, allow_docker_socket=false, confirm)` | Neuer Git-Stack (Portainer "Repository", `POST /api/stacks/create/standalone/repository`). Nur öffentliche GitHub-Repositories: die Compose-Datei wird vorher über raw.githubusercontent.com geladen und wie bei `portainer_stack_create` geprüft. Vorschau zeigt Env-Namen, fehlende Variablen ohne Default und ungenutzte Variablen. Optional GitOps-Polling. Wartet auf das Deploy |
-| `portainer_stack_update(stack_id, compose_content, env_set, env_unset, pull_image=true, allow_docker_socket=false, confirm)` | Bestehenden Compose-Stack ändern und neu ausrollen (`Prune=false`). Compose-Datei ersetzen und/oder einzelne Env-Variablen setzen/entfernen; alle übrigen Env-Werte bleiben erhalten und laufen nicht durch den Chat. Vorschau mit geschwärztem Diff und den betroffenen Env-Namen. Nicht für Git-Stacks |
+| `portainer_stack_update(stack_id, compose_content, env_set, env_unset, pull_image=true, allow_docker_socket=false, confirm)` | Bestehenden Compose-Stack ändern und neu ausrollen (`Prune=false`). Compose-Datei ersetzen und/oder einzelne Env-Variablen setzen/entfernen; alle übrigen Env-Werte bleiben erhalten und laufen nicht durch den Chat. Vorschau mit geschwärztem Diff und den betroffenen Env-Namen (`neu`/`geändert`/`entfernt`; neue Werte nur, wenn der Name nicht nach Secret aussieht, bestehende Werte nie). Git-Stacks: nur `env_set`/`env_unset` (siehe unten), `compose_content` bleibt gesperrt |
 
 ### Git-Stacks (Portainer ab 2.4x)
 
-Portainer speichert die Git-Daten eines Stacks in einer GitOps-Source. Hat der API-Benutzer keinen Zugriff auf diese Source, liefert die API `GitConfig: null`, `WorkflowID` ist aber gesetzt. infra-mcp behandelt jeden Stack mit `WorkflowID` als Git-Stack und schickt dafür nie `PUT /stacks/{id}` - das würde die Git-Anbindung lösen und den Stack zum Editor-Stack machen. Redeploys laufen immer über `git/redeploy`; ohne Zugriff auf die Source meldet das Tool, dass der Benutzer Zugriff auf die Source braucht. `portainer_stack_update` ist für Git-Stacks gesperrt.
+Portainer speichert die Git-Daten eines Stacks in einer GitOps-Source. Hat der API-Benutzer keinen Zugriff auf diese Source, liefert die API `GitConfig: null`, `WorkflowID` ist aber gesetzt. infra-mcp behandelt jeden Stack mit `WorkflowID` als Git-Stack und schickt dafür nie `PUT /stacks/{id}` - das würde die Git-Anbindung lösen und den Stack zum Editor-Stack machen. Redeploys laufen immer über `git/redeploy`; ohne Zugriff auf die Source meldet das Tool, dass der Benutzer Zugriff auf die Source braucht.
+
+`portainer_stack_update` ändert bei Git-Stacks nur Env-Variablen (`env_set`, `env_unset`); eine neue Compose-Datei wird abgelehnt, die gehört ins Repository. Ablauf:
+
+- Die aktuelle Env wird aus `GET /api/stacks/{id}` geladen, nur die genannten Namen werden gesetzt bzw. entfernt, alle anderen Werte unverändert übernommen. Fehlt bei einem bestehenden Eintrag der Wert, bricht das Tool ab.
+- Ausgerollt wird mit `PUT /api/stacks/{id}/git/redeploy?endpointId=..` und der vollständigen Liste im Feld `Env`. Portainer ersetzt die Env damit komplett (geprüft gegen den Quellcode 2.45.2: ohne `Env` bleibt sie unverändert, mit `Env` wird sie ersetzt). Deshalb wird nie eine Teilliste geschickt.
+- Die bisherige Git-Referenz geht als `RepositoryReferenceName` mit. Ist sie nicht sichtbar (kein Zugriff auf die GitOps-Source), bricht das Tool ab.
+- `pull_image` wie bei `portainer_stack_redeploy`, `Prune` immer aus.
+- Mit `confirm=true` wartet das Tool auf das Deploy, meldet eine Fehlermeldung von Portainer und prüft danach, ob die gespeicherte Env der geschickten entspricht.
+- Pro geänderter Variable ein Audit-Eintrag `stack_env_change` (Stack, Name, Aktion, ohne Wert).
 
 ### Compose-Prüfung
 

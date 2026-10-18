@@ -550,6 +550,194 @@ async def test_stack_update_refuses_workflow_stack(mock):
 
 
 # ---------------------------------------------------------------------------
+# portainer_stack_update auf Git-Stacks: nur env_set / env_unset
+# ---------------------------------------------------------------------------
+
+GIT_ENV = [
+    {"name": "API_TOKEN", "value": "token-geheim-123"},
+    {"name": "MODE", "value": "alt-wert-a"},
+    {"name": "MCP_HOST_PORT", "value": "8424"},
+]
+
+
+def git_stack_json(env=None, status=1, **extra):
+    s = {
+        "Id": 30, "Name": "gitenv", "Type": 2, "EndpointId": 2, "Status": status, "WorkflowID": 7,
+        "GitConfig": {"URL": "https://github.com/example/app", "ReferenceName": "refs/heads/release", "ConfigFilePath": "docker-compose.yml"},
+        "Env": GIT_ENV if env is None else env,
+    }
+    s.update(extra)
+    return s
+
+
+@pytest.fixture
+def gitupd(mock):
+    """Git-Stack 30: der zweite GET liefert den Stand nach dem Deploy (Env wie geschickt)."""
+    state = {"env": GIT_ENV}
+
+    def stack_get(request):
+        return httpx.Response(200, json=git_stack_json(state["env"]))
+
+    def redeploy(request):
+        state["env"] = json.loads(request.read())["Env"]
+        return httpx.Response(200, json={"Id": 30})
+
+    mock.get(f"{PORTAINER_API}/stacks/30").mock(side_effect=stack_get)
+    mock.get(f"{PORTAINER_API}/endpoints/2/docker/containers/json").respond(200, json=[])
+    put = mock.put(f"{PORTAINER_API}/stacks/30").respond(200, json={})
+    git = mock.put(f"{PORTAINER_API}/stacks/30/git/redeploy").mock(side_effect=redeploy)
+    return {"put": put, "git": git, "router": mock}
+
+
+async def test_git_stack_env_preview_marks_actions_and_hides_secrets(gitupd):
+    prev = await tools_portainer.portainer_stack_update(
+        30, env_set={"MODE": "neu-wert-b", "NEW_FLAG": "1", "DB_PASSWORD": "pw-neu-456"}, env_unset=["MCP_HOST_PORT"]
+    )
+    assert prev["preview"] is True and prev["executed"] is False
+    assert written(gitupd["router"]) == []
+    changes = {c["name"]: c for c in prev["env_changes"]}
+    assert changes["MODE"] == {"name": "MODE", "aktion": "geändert", "wert": "neu-wert-b"}
+    assert changes["NEW_FLAG"] == {"name": "NEW_FLAG", "aktion": "neu", "wert": "1"}
+    assert changes["DB_PASSWORD"] == {"name": "DB_PASSWORD", "aktion": "neu", "wert": "***"}
+    assert changes["MCP_HOST_PORT"] == {"name": "MCP_HOST_PORT", "aktion": "entfernt"}
+    dumped = json.dumps(prev)
+    # Bestehende Werte nie, neue Secret-Werte nie
+    for v in ("token-geheim-123", "alt-wert-a", "pw-neu-456"):
+        assert v not in dumped
+    assert prev["reference"] == "refs/heads/release" and prev["prune"] is False
+
+
+@pytest.mark.parametrize("name", ["SMTP_PASSWORD", "GITHUB_TOKEN", "API_KEY", "CLIENT_SECRET"])
+async def test_git_stack_env_preview_masks_secret_names(gitupd, name):
+    prev = await tools_portainer.portainer_stack_update(30, env_set={name: "sehr-geheim-789"})
+    assert prev["env_changes"] == [{"name": name, "aktion": "neu", "wert": "***"}]
+    assert "sehr-geheim-789" not in json.dumps(prev)
+
+
+async def test_git_stack_env_execute_sends_full_env_and_keeps_reference(gitupd, capsys):
+    out = await tools_portainer.portainer_stack_update(
+        30, env_set={"MODE": "neu-wert-b", "MCP_BIND_ADDR": "192.0.2.10"}, pull_image=False, confirm=True
+    )
+    assert gitupd["put"].call_count == 0 and gitupd["git"].call_count == 1
+    req = gitupd["git"].calls.last.request
+    assert req.url.params["endpointId"] == "2"
+    body = json.loads(req.read())
+    assert body["Env"] == [
+        {"name": "API_TOKEN", "value": "token-geheim-123"},
+        {"name": "MODE", "value": "neu-wert-b"},
+        {"name": "MCP_HOST_PORT", "value": "8424"},
+        {"name": "MCP_BIND_ADDR", "value": "192.0.2.10"},
+    ]
+    assert body["RepositoryReferenceName"] == "refs/heads/release"
+    assert body["Prune"] is False and body["PullImage"] is False and body["RepullImageAndRedeploy"] is False
+    assert "StackFileContent" not in body
+    assert out["executed"] is True and out["stack_status"] == "active"
+    assert "token-geheim-123" not in json.dumps(out)
+    # Audit: ein Eintrag pro Variable, ohne Werte
+    events = [json.loads(ln) for ln in capsys.readouterr().out.splitlines() if ln.startswith("{")]
+    env_events = [e for e in events if e["event"] == "stack_env_change"]
+    assert sorted((e["variable"], e["aktion"]) for e in env_events) == [("MCP_BIND_ADDR", "neu"), ("MODE", "geändert")]
+    assert all(e["stack"] == "gitenv" and e["stack_id"] == 30 for e in env_events)
+    assert "neu-wert-b" not in json.dumps(env_events) and "192.0.2.10" not in json.dumps(env_events)
+
+
+async def test_git_stack_env_unset(gitupd):
+    await tools_portainer.portainer_stack_update(30, env_unset=["MODE"], confirm=True)
+    body = json.loads(gitupd["git"].calls.last.request.read())
+    assert [e["name"] for e in body["Env"]] == ["API_TOKEN", "MCP_HOST_PORT"]
+    assert body["PullImage"] is True
+
+
+async def test_git_stack_compose_content_still_refused(gitupd):
+    with pytest.raises(GuardError, match="compose_content ist hier gesperrt"):
+        await tools_portainer.portainer_stack_update(30, compose_content=NEW_COMPOSE, env_set={"MODE": "b"}, confirm=True)
+    assert written(gitupd["router"]) == []
+
+
+async def test_git_stack_env_nothing_or_no_change(gitupd):
+    with pytest.raises(GuardError, match="Nichts zu ändern"):
+        await tools_portainer.portainer_stack_update(30, confirm=True)
+    with pytest.raises(GuardError, match="Keine Änderung"):
+        await tools_portainer.portainer_stack_update(30, env_set={"MODE": "alt-wert-a"}, confirm=True)
+    with pytest.raises(GuardError, match="nicht im Stack"):
+        await tools_portainer.portainer_stack_update(30, env_unset=["GIBTSNICHT"], confirm=True)
+    with pytest.raises(GuardError, match="gleichzeitig"):
+        await tools_portainer.portainer_stack_update(30, env_set={"MODE": "x"}, env_unset=["MODE"], confirm=True)
+    assert written(gitupd["router"]) == []
+
+
+async def test_git_stack_env_aborts_on_incomplete_env(mock):
+    mock.get(f"{PORTAINER_API}/stacks/30").respond(200, json=git_stack_json([{"name": "API_TOKEN"}, {"name": "MODE", "value": "a"}]))
+    mock.get(f"{PORTAINER_API}/endpoints/2/docker/containers/json").respond(200, json=[])
+    git = mock.put(f"{PORTAINER_API}/stacks/30/git/redeploy").respond(200, json={})
+    with pytest.raises(GuardError, match="unvollständig"):
+        await tools_portainer.portainer_stack_update(30, env_set={"MODE": "b"}, confirm=True)
+    assert git.call_count == 0
+
+
+async def test_git_stack_env_without_visible_reference_aborts(mock):
+    mock.get(f"{PORTAINER_API}/stacks/31").respond(
+        200, json={"Id": 31, "Name": "gitapp4", "Type": 2, "EndpointId": 1, "WorkflowID": 8, "GitConfig": None, "Env": []}
+    )
+    mock.get(f"{PORTAINER_API}/endpoints/1/docker/containers/json").respond(200, json=[])
+    git = mock.put(f"{PORTAINER_API}/stacks/31/git/redeploy").respond(200, json={})
+    put = mock.put(f"{PORTAINER_API}/stacks/31").respond(200, json={})
+    with pytest.raises(GuardError, match="Git-Referenz"):
+        await tools_portainer.portainer_stack_update(31, env_set={"MODE": "b"}, confirm=True)
+    assert git.call_count == 0 and put.call_count == 0
+
+
+async def test_git_stack_env_blocked_for_protected_stack(mock):
+    mock.get(f"{PORTAINER_API}/stacks/32").respond(200, json=git_stack_json(Id=32, Name="core-git"))
+    git = mock.put(f"{PORTAINER_API}/stacks/32/git/redeploy").respond(200, json={})
+    with pytest.raises(GuardError, match="geschützt"):
+        await tools_portainer.portainer_stack_update(32, env_set={"MODE": "b"})
+    assert git.call_count == 0
+
+
+async def test_git_stack_env_blocked_by_protected_container(mock):
+    mock.get(f"{PORTAINER_API}/stacks/30").respond(200, json=git_stack_json())
+    mock.get(f"{PORTAINER_API}/endpoints/2/docker/containers/json").respond(
+        200, json=[{"Id": "abc", "Names": ["/db-main"], "Labels": {"com.docker.compose.project": "gitenv"}}]
+    )
+    git = mock.put(f"{PORTAINER_API}/stacks/30/git/redeploy").respond(200, json={})
+    with pytest.raises(GuardError, match="db-main"):
+        await tools_portainer.portainer_stack_update(30, env_set={"MODE": "b"}, confirm=True)
+    assert git.call_count == 0
+
+
+async def test_git_stack_env_reports_deploy_error(mock):
+    mock.get(f"{PORTAINER_API}/stacks/30").mock(side_effect=[
+        httpx.Response(200, json=git_stack_json()),
+        httpx.Response(200, json=git_stack_json(status=4, DeploymentStatus=[{"Message": "pull access denied"}])),
+    ])
+    mock.get(f"{PORTAINER_API}/endpoints/2/docker/containers/json").respond(200, json=[])
+    mock.put(f"{PORTAINER_API}/stacks/30/git/redeploy").respond(200, json={"Id": 30})
+    from infra_mcp.errors import PortainerError
+
+    with pytest.raises(PortainerError, match="pull access denied"):
+        await tools_portainer.portainer_stack_update(30, env_set={"MODE": "b"}, confirm=True)
+
+
+async def test_git_stack_env_detects_env_not_taken_over(mock):
+    # Portainer meldet Erfolg, hat die Env aber nicht übernommen -> Fehler statt "ok"
+    mock.get(f"{PORTAINER_API}/stacks/30").respond(200, json=git_stack_json())
+    mock.get(f"{PORTAINER_API}/endpoints/2/docker/containers/json").respond(200, json=[])
+    mock.put(f"{PORTAINER_API}/stacks/30/git/redeploy").respond(200, json={"Id": 30})
+    from infra_mcp.errors import PortainerError
+
+    with pytest.raises(PortainerError, match="nicht wie geschickt") as exc:
+        await tools_portainer.portainer_stack_update(30, env_set={"MODE": "neu-wert-b"}, confirm=True)
+    assert "MODE" in str(exc.value) and "neu-wert-b" not in str(exc.value)
+
+
+def test_audit_params_hide_env_set_values():
+    out = guard.redact_params({"stack_id": 30, "env_set": {"MODE": "klartext-wert"}, "env_unset": ["X"]})
+    assert out["env_set"] == {"names": ["MODE"]}
+    assert "klartext-wert" not in json.dumps(out)
+
+
+# ---------------------------------------------------------------------------
 # portainer_stack_create_git
 # ---------------------------------------------------------------------------
 

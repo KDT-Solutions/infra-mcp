@@ -280,7 +280,7 @@ def redact_params(params: dict[str, Any]) -> dict[str, Any]:
     for k, v in params.items():
         if k in _PARAM_SUMMARY_KEYS:
             out[k] = {"chars": len(v)} if isinstance(v, str) else None
-        elif k == "env":
+        elif k in ("env", "env_set"):
             out[k] = {"names": env_names(v)}
         elif is_secret_name(k):
             out[k] = MASK

@@ -9,7 +9,7 @@ import re
 import time
 from typing import Any
 
-from . import gitsource, guard
+from . import audit, gitsource, guard
 from .app import portainer, tool
 from .errors import GuardError, PortainerError, UnclearStateError
 from .portainer_client import (
@@ -699,6 +699,134 @@ async def portainer_stack_create_git(
     return out
 
 
+def _merge_env(
+    stack: dict[str, Any], env_set: dict[str, str] | None, env_unset: list[str] | None
+) -> tuple[list[dict[str, str]], list[dict[str, str]], list[str], list[str], list[str]]:
+    """Aktuelle Env des Stacks mit env_set/env_unset zusammenführen.
+    Liefert (bestehend, neu zusammengeführt, neu, geändert, entfernt). Alle nicht genannten
+    Variablen werden mit ihrem Wert unverändert übernommen. Ein Eintrag ohne Wert (z.B. von
+    einer Portainer-Version, die Werte nicht ausliefert) bricht ab - sonst würde eine
+    unvollständige Env-Liste geschrieben."""
+    existing: list[dict[str, str]] = []
+    for e in stack.get("Env") or []:
+        if not isinstance(e, dict) or not e.get("name") or "value" not in e:
+            raise GuardError(
+                f"Stack '{stack.get('Name')}': die aktuelle Env ist unvollständig lesbar (Eintrag ohne Name oder "
+                "Wert). Abgebrochen, nichts geändert - sonst würden bestehende Werte überschrieben."
+            )
+        existing.append({"name": str(e["name"]), "value": "" if e["value"] is None else str(e["value"])})
+    names = [e["name"] for e in existing]
+    sets = env_pairs(env_set)
+    unset = [str(n).strip() for n in (env_unset or []) if str(n).strip()]
+    unknown = [n for n in unset if n not in names]
+    if unknown:
+        raise GuardError(f"env_unset: Variable(n) nicht im Stack vorhanden: {', '.join(unknown)}")
+    both = sorted({p["name"] for p in sets} & set(unset))
+    if both:
+        raise GuardError(f"Variable(n) gleichzeitig in env_set und env_unset: {', '.join(both)}")
+    merged = [dict(e) for e in existing if e["name"] not in unset]
+    added, changed = [], []
+    for p in sets:
+        hit = next((e for e in merged if e["name"] == p["name"]), None)
+        if hit is None:
+            merged.append(p)
+            added.append(p["name"])
+        elif hit["value"] != p["value"]:
+            hit["value"] = p["value"]
+            changed.append(p["name"])
+    return existing, merged, added, changed, unset
+
+
+def _env_change_list(
+    sets: dict[str, str] | None, added: list[str], changed: list[str], removed: list[str]
+) -> list[dict[str, Any]]:
+    """Betroffene Variablen für Vorschau und Resultat. Neue Werte nur, wenn der Name
+    nicht nach Secret aussieht (PASSWORD, TOKEN, KEY, SECRET ...); bisherige Werte nie."""
+    values = {p["name"]: p["value"] for p in env_pairs(sets)}
+    out: list[dict[str, Any]] = []
+    for action, names in (("neu", added), ("geändert", changed)):
+        for n in names:
+            out.append({"name": n, "aktion": action, "wert": guard.MASK if guard.is_secret_name(n) else values.get(n)})
+    for n in removed:
+        out.append({"name": n, "aktion": "entfernt"})
+    return out
+
+
+def _audit_env_changes(stack: dict[str, Any], added: list[str], changed: list[str], removed: list[str]) -> None:
+    """Ein Audit-Eintrag pro geänderter Variable: Stack, Name, Aktion - nie der Wert."""
+    for action, names in (("neu", added), ("geändert", changed), ("entfernt", removed)):
+        for n in names:
+            audit.log_event(
+                "stack_env_change", stack=stack.get("Name"), stack_id=stack.get("Id"), variable=n, aktion=action
+            )
+
+
+async def _update_git_stack_env(
+    stack: dict[str, Any],
+    env_set: dict[str, str] | None,
+    env_unset: list[str] | None,
+    pull_image: bool,
+    confirm: bool,
+) -> dict[str, Any]:
+    """Env eines Git-Stacks ändern: PUT /stacks/{id}/git/redeploy mit vollständiger Env-Liste.
+
+    Portainer (geprüft gegen 2.45.2, stack_update_git_redeploy.go) ersetzt die Env des Stacks
+    komplett, sobald das Feld Env im Payload steht; ohne Env bleibt sie unverändert. Darum wird
+    immer die ganze, aus der aktuellen Env zusammengeführte Liste geschickt. Die Git-Referenz
+    wird explizit mitgegeben (RepositoryReferenceName), Prune ist immer aus."""
+    sid, eid = stack["Id"], stack.get("EndpointId")
+    git = stack.get("GitConfig") or {}
+    ref = git.get("ReferenceName") or ""
+    if not ref:
+        raise GuardError(
+            f"Stack '{stack.get('Name')}' ist ein Git-Stack, die Git-Referenz ist aber nicht sichtbar (kein Zugriff "
+            "auf die GitOps-Source). Abgebrochen, nichts geändert. In Portainer dem API-Benutzer bzw. seinem Team "
+            "Zugriff auf die Source geben."
+        )
+    if not env_set and not env_unset:
+        raise GuardError("Nichts zu ändern: env_set oder env_unset angeben.")
+    existing, merged, added, changed, removed = _merge_env(stack, env_set, env_unset)
+    if not (added or changed or removed):
+        raise GuardError("Keine Änderung gegenüber dem aktuellen Stand.")
+    pull = bool(pull_image)
+    details = {
+        "stack": stack_summary(stack),
+        "method": "git_redeploy",
+        "reference": ref,
+        "env_changes": _env_change_list(env_set, added, changed, removed),
+        "env_added": added,
+        "env_changed": changed,
+        "env_removed": removed,
+        "pull_image": pull,
+        "prune": False,
+    }
+    if not guard.is_confirmed(confirm):
+        return guard.preview("stack_update", **details)
+
+    payload = {
+        "RepositoryReferenceName": ref,
+        "Env": merged,
+        "Prune": False,
+        "PullImage": pull,
+        "RepullImageAndRedeploy": pull,
+    }
+    await portainer().stack_git_redeploy(sid, eid, payload)
+    _audit_env_changes(stack, added, changed, removed)
+    done = await wait_for_stack_deploy(sid)
+    # Kontrolle: hat Portainer die Env so übernommen, wie sie geschickt wurde?
+    after = await portainer().stack(sid)
+    stored = {str(e.get("name")): "" if e.get("value") is None else str(e.get("value"))
+              for e in (after.get("Env") or []) if isinstance(e, dict)}
+    expected = {e["name"]: e["value"] for e in merged}
+    if stored != expected:
+        diff = sorted(n for n in set(stored) | set(expected) if stored.get(n) != expected.get(n))
+        raise PortainerError(
+            f"Stack {sid}: Portainer hat die Env nach git/redeploy nicht wie geschickt gespeichert "
+            f"(abweichend: {', '.join(diff)}). Bitte den Stack in Portainer prüfen."
+        )
+    return {"executed": True, "action": "stack_update", **details, "stack_status": done["status"]}
+
+
 @tool()
 async def portainer_stack_update(
     stack_id: int,
@@ -712,19 +840,25 @@ async def portainer_stack_update(
     """Bestehenden Compose-Stack ändern und neu ausrollen (prune aus).
 
     compose_content: neue Compose-Datei (leer lassen = bestehende behalten). Wird gleich
-    geprüft wie bei portainer_stack_create.
+    geprüft wie bei portainer_stack_create. Bei Git-Stacks nicht möglich (dort im Repository ändern).
     env_set: {NAME: wert} setzt oder ändert einzelne Variablen, env_unset: Namen entfernen.
     Alle übrigen Env-Werte bleiben unverändert erhalten und laufen nicht durch den Chat -
     Secrets daher möglichst direkt in Portainer pflegen und hier nur die Compose-Datei ändern.
+    Git-Stacks: env_set/env_unset werden per git/redeploy mit der bisherigen Git-Referenz
+    ausgerollt, pull_image wie bei portainer_stack_redeploy.
     Ohne confirm=true nur Vorschau mit Diff der Compose-Datei (geschwärzt) und den
-    betroffenen Env-Namen."""
+    betroffenen Env-Namen (neu/geändert/entfernt; Werte nur ohne Secret-Namen)."""
     stack = await _stack_checked(stack_id)
     _require_compose_type(stack)
     if is_git_stack(stack):
-        raise GuardError(
-            f"Stack '{stack.get('Name')}' wird aus Git ausgerollt; die Compose-Datei dort ändern und "
-            "portainer_stack_redeploy verwenden."
-        )
+        if compose_content is not None and compose_content.strip():
+            raise GuardError(
+                f"Stack '{stack.get('Name')}' wird aus Git ausgerollt; compose_content ist hier gesperrt. Die "
+                "Compose-Datei im Repository ändern und portainer_stack_redeploy verwenden. Env-Variablen lassen "
+                "sich mit env_set/env_unset ändern."
+            )
+        await _block_protected_stack(stack)
+        return await _update_git_stack_env(stack, env_set, env_unset, pull_image, confirm)
     await _block_protected_stack(stack)
     if compose_content is None and not env_set and not env_unset:
         raise GuardError("Nichts zu ändern: compose_content, env_set oder env_unset angeben.")
@@ -736,26 +870,7 @@ async def portainer_stack_update(
     new_content = current if compose_content is None or not compose_content.strip() else compose_content
     guard.validate_compose(new_content, allow_docker_socket)
 
-    existing = [
-        {"name": str(e.get("name")), "value": "" if e.get("value") is None else str(e.get("value"))}
-        for e in (stack.get("Env") or []) if isinstance(e, dict) and e.get("name")
-    ]
-    names = [e["name"] for e in existing]
-    sets = env_pairs(env_set)
-    unset = [str(n).strip() for n in (env_unset or []) if str(n).strip()]
-    unknown = [n for n in unset if n not in names]
-    if unknown:
-        raise GuardError(f"env_unset: Variable(n) nicht im Stack vorhanden: {', '.join(unknown)}")
-    merged = [e for e in existing if e["name"] not in unset]
-    added, changed = [], []
-    for p in sets:
-        hit = next((e for e in merged if e["name"] == p["name"]), None)
-        if hit is None:
-            merged.append(p)
-            added.append(p["name"])
-        elif hit["value"] != p["value"]:
-            hit["value"] = p["value"]
-            changed.append(p["name"])
+    existing, merged, added, changed, unset = _merge_env(stack, env_set, env_unset)
 
     secrets = [e["value"] for e in merged + existing if e["value"] and len(e["value"]) >= 4 and guard.is_secret_name(e["name"])]
     diff = "".join(
@@ -772,6 +887,7 @@ async def portainer_stack_update(
         "env_added": added,
         "env_changed": changed,
         "env_removed": unset,
+        "env_changes": _env_change_list(env_set, added, changed, unset),
         "pull_image": bool(pull_image),
         "prune": False,
     }
@@ -788,6 +904,7 @@ async def portainer_stack_update(
         "RepullImageAndRedeploy": pull,
     }
     await portainer().stack_update_compose(sid, eid, payload)
+    _audit_env_changes(stack, added, changed, unset)
     done = await wait_for_stack_deploy(sid)
     details.pop("compose_diff")
     return {"executed": True, "action": "stack_update", **details, "stack_status": done["status"]}
