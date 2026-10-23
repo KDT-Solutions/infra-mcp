@@ -155,7 +155,6 @@ async def infra_publish_service(
     websocket: bool = False,
     service: str | None = None,
     forward_scheme: str = "http",
-    allow_docker_socket: bool = False,
     confirm: bool = False,
 ) -> dict[str, Any]:
     """Neuen Dienst komplett veröffentlichen:
@@ -179,7 +178,7 @@ async def infra_publish_service(
     guard.require_protected_domains_configured()
 
     # 1. Prüfungen (auch in der Vorschau)
-    doc = await precheck_stack_create(stack_name, endpoint_id, compose_content, allow_docker_socket)
+    doc = await precheck_stack_create(stack_name, endpoint_id, compose_content)
     eid = int(endpoint_id)
     d = guard.validate_domain(domain)
     guard.block(guard.domain_protection([d]))

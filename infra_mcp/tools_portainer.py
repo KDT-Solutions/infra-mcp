@@ -583,11 +583,11 @@ def env_pairs(env: dict[str, Any] | None) -> list[dict[str, str]]:
     return out
 
 
-async def precheck_stack_create(name: str, endpoint_id: int, compose_content: str, allow_docker_socket: bool) -> dict[str, Any]:
+async def precheck_stack_create(name: str, endpoint_id: int, compose_content: str) -> dict[str, Any]:
     n = guard.validate_stack_name(name)
     guard.block(guard.stack_protection(n))
     guard.validate_positive_id(endpoint_id, "endpoint_id")
-    doc = guard.validate_compose(compose_content, allow_docker_socket)
+    doc = guard.validate_compose(compose_content)
     if await find_stack_by_name(n):
         raise GuardError(f"Stack-Name '{n}' ist bereits vergeben.")
     return doc
@@ -599,13 +599,14 @@ async def portainer_stack_create(
     endpoint_id: int,
     compose_content: str,
     env: dict[str, str] | None = None,
-    allow_docker_socket: bool = False,
     confirm: bool = False,
 ) -> dict[str, Any]:
     """Neuen Compose-Stack anlegen. Die Compose-Datei wird vorher geprüft
-    (YAML gültig, keine privileged-Container, kein Docker-Socket-Mount ohne
-    allow_docker_socket=true). env: {NAME: wert}. Ohne confirm=true nur Vorschau."""
-    doc = await precheck_stack_create(name, endpoint_id, compose_content, allow_docker_socket)
+    (YAML gültig, keine privileged-Container, keine Host-/Fremd-Namespaces, Bind-Mounts
+    nur unter BIND_MOUNT_ALLOWED_PREFIXES, Docker-Socket nur mit der Server-Einstellung
+    ALLOW_DOCKER_SOCKET_STACKS=true, benannte Volumes nur aus dem Dokument selbst).
+    env: {NAME: wert}. Ohne confirm=true nur Vorschau."""
+    doc = await precheck_stack_create(name, endpoint_id, compose_content)
     pairs = env_pairs(env)
     details = {
         "name": name,
@@ -637,7 +638,6 @@ async def portainer_stack_create_git(
     env: dict[str, str] | None = None,
     auto_update_interval: str | None = None,
     force_pull_image: bool = True,
-    allow_docker_socket: bool = False,
     confirm: bool = False,
 ) -> dict[str, Any]:
     """Neuen Compose-Stack aus einem Git-Repository anlegen (Portainer "Repository").
@@ -659,7 +659,7 @@ async def portainer_stack_create_git(
     if await find_stack_by_name(n):
         raise GuardError(f"Stack-Name '{n}' ist bereits vergeben.")
     content = await gitsource.fetch_compose(owner, repo, ref, path)
-    doc = guard.validate_compose(content, allow_docker_socket)
+    doc = guard.validate_compose(content)
     pairs = env_pairs(env)
     referenced = sorted(set(re.findall(r"\$\{([A-Za-z_][A-Za-z0-9_]*)(?::?-[^}]*)?\}", content)))
     required = sorted(set(re.findall(r"\$\{([A-Za-z_][A-Za-z0-9_]*)\}", content)))
@@ -834,7 +834,6 @@ async def portainer_stack_update(
     env_set: dict[str, str] | None = None,
     env_unset: list[str] | None = None,
     pull_image: bool = True,
-    allow_docker_socket: bool = False,
     confirm: bool = False,
 ) -> dict[str, Any]:
     """Bestehenden Compose-Stack ändern und neu ausrollen (prune aus).
@@ -868,7 +867,7 @@ async def portainer_stack_update(
     if not current:
         raise PortainerError(f"Stack {sid}: Compose-Datei konnte nicht gelesen werden.")
     new_content = current if compose_content is None or not compose_content.strip() else compose_content
-    guard.validate_compose(new_content, allow_docker_socket)
+    guard.validate_compose(new_content)
 
     existing, merged, added, changed, unset = _merge_env(stack, env_set, env_unset)
 

@@ -27,6 +27,10 @@ services:
       - PROTECTED_STACKS=${PROTECTED_STACKS:-}
       - PROTECTED_DOMAINS=${PROTECTED_DOMAINS}
       - GIT_ALLOWED_REPO_PREFIXES=${GIT_ALLOWED_REPO_PREFIXES:-}
+      # Compose-Prüfung: Bind-Mounts nur unter diesen Host-Verzeichnissen (leer = keine),
+      # Docker-Socket-Mounts in Stacks nur mit ALLOW_DOCKER_SOCKET_STACKS=true
+      - BIND_MOUNT_ALLOWED_PREFIXES=${BIND_MOUNT_ALLOWED_PREFIXES:-}
+      - ALLOW_DOCKER_SOCKET_STACKS=${ALLOW_DOCKER_SOCKET_STACKS:-false}
       - MCP_API_KEY=${MCP_API_KEY}
       # Host-Ressourcen über den node-exporter unten (infra_host_resources/-history)
       - NODE_EXPORTER_URL=${NODE_EXPORTER_URL:-http://infra-mcp-node-exporter:9100/metrics}

@@ -230,6 +230,110 @@ async def test_proxy_host_update_shows_diff(npm_login):
     assert json.loads(put.calls.last.request.read()) == {"forward_port": 9000, "allow_websocket_upgrade": True}
 
 
+# ---------------------------------------------------------------------------
+# NPM advanced_config: nginx-Direktiven-Allowlist
+# ---------------------------------------------------------------------------
+
+ADV_OK = (
+    "# Kommentar\n"
+    "add_header X-Frame-Options SAMEORIGIN;\n"
+    "add_header X-Robots-Tag \"noindex, nofollow\" always;\n"
+    "add_header X-Request-Id $request_id;\n"
+    "expires 30d;\n"
+    "expires modified +24h;\n"
+    "client_max_body_size 100m;\n"
+    "proxy_read_timeout 300s;\n"
+    "proxy_send_timeout 300;\n"
+    "proxy_connect_timeout 10s;\n"
+    "proxy_buffering off;\n"
+    "proxy_buffer_size 16k;\n"
+    "proxy_buffers 8 16k;\n"
+    "gzip on;\n"
+    "gzip_types text/plain application/json image/svg+xml;\n"
+    "real_ip_header X-Forwarded-For;\n"
+    "set_real_ip_from 10.0.0.0/8;\n"
+    "  set_real_ip_from 2001:db8::/32;  \n"
+)
+
+
+def test_advanced_config_allowed_directives():
+    out = guard.validate_advanced_config(ADV_OK)
+    assert "proxy_buffers 8 16k;" in out and "set_real_ip_from 2001:db8::/32;" in out
+    assert guard.validate_advanced_config(None) == "" and guard.validate_advanced_config("  \n ") == ""
+    assert guard.validate_advanced_config("add_header X-A b;\r\nexpires off;") == "add_header X-A b;\nexpires off;"
+
+
+@pytest.mark.parametrize("cfg,match", [
+    ("location /x { proxy_pass http://127.0.0.1:81; }", "Blöcke"),
+    ("location /k {\n  alias /data/;\n  autoindex on;\n}", "Blöcke"),
+    ("proxy_pass http://portainer:9000;", "proxy_pass"),
+    ("alias /etc/letsencrypt/;", "alias"),
+    ("root /data;", "root"),
+    ("include /etc/nginx/conf.d/*.conf;", "include"),
+    ("return 301 https://evil.example;", "return"),
+    ("rewrite ^ /x permanent;", "rewrite"),
+    ("auth_basic_user_file /data/htpasswd;", "auth_basic_user_file"),
+    ("access_by_lua_block { os.execute('id') }", "Blöcke"),
+    ("content_by_lua 'ngx.say(1)';", "content_by_lua"),
+    ("ssl_certificate /etc/letsencrypt/live/x/fullchain.pem;", "ssl_certificate"),
+    ("add_header X-A b; proxy_pass http://x;", "genau eine Direktive"),
+    ("add_header X-A \"b; proxy_pass http://x\";", "genau eine Direktive"),
+    ("add_header X-A b", "genau eine Direktive"),
+    ("add_header X-A b;; gzip on;", "genau eine Direktive"),
+    ("add_header 'X A' b;", "Argumente von 'add_header'"),
+    ("add_header X-A \"a\nb\";", "genau eine Direktive"),
+    ("gzip maybe;", "Argumente von 'gzip'"),
+    ("client_max_body_size $x;", "Argumente von 'client_max_body_size'"),
+    ("set_real_ip_from evil.example;", "Argumente von 'set_real_ip_from'"),
+    ("expires 30d {", "Blöcke"),
+    ("add_header X-A b;\x00", "Steuerzeichen"),
+    ("add_header X-A " + "b" * 4000 + ";", "Zeichen"),
+    ("\n".join(["gzip on;"] * 61), "Zeilen"),
+])
+def test_advanced_config_rejected(cfg, match):
+    with pytest.raises(GuardError, match=match):
+        guard.validate_advanced_config(cfg)
+
+
+def test_locations_advanced_config_checked():
+    with pytest.raises(GuardError, match=r"locations\[1\]\.advanced_config.*proxy_pass"):
+        guard.validate_locations([
+            {"path": "/a", "advanced_config": "expires 1d;"},
+            {"path": "/b", "advanced_config": "proxy_pass http://127.0.0.1:81;"},
+        ])
+    out = guard.validate_locations([{"path": "/a", "advanced_config": None}])
+    assert out == [{"path": "/a", "advanced_config": ""}]
+
+
+async def test_proxy_host_create_preview_rejects_advanced_config(npm_login, dns_ok):
+    """Ablehnung schon in der Vorschau ohne confirm, nichts wird angelegt."""
+    npm_login.get(f"{NPM_API}/nginx/proxy-hosts").respond(200, json=[])
+    npm_login.get(f"{NPM_API}/nginx/redirection-hosts").respond(200, json=[])
+    bad = "location /x { proxy_pass http://127.0.0.1:81; }"
+    with pytest.raises(GuardError, match="advanced_config"):
+        await tools_npm.npm_proxy_host_create(["app.example.com"], "http", "app", 8080, advanced_config=bad)
+    with pytest.raises(GuardError, match="advanced_config"):
+        await tools_npm.npm_proxy_host_create(["app.example.com"], "http", "app", 8080, advanced_config=bad, confirm=True)
+    assert written(npm_login) == []
+    out = await tools_npm.npm_proxy_host_create(
+        ["app.example.com"], "http", "app", 8080, ssl=False, advanced_config="client_max_body_size 50m;\ngzip on;"
+    )
+    assert out["preview"] is True and out["payload"]["advanced_config"] == "client_max_body_size 50m;\ngzip on;"
+
+
+async def test_proxy_host_update_rejects_advanced_config(npm_login):
+    npm_login.get(f"{NPM_API}/nginx/proxy-hosts/8").respond(200, json=proxy_host(8, ["app.example.com"]))
+    put = npm_login.put(f"{NPM_API}/nginx/proxy-hosts/8").respond(200, json={"id": 8})
+    for cfg in ("alias /data/;", "proxy_pass http://portainer:9000;", "location / { }"):
+        with pytest.raises(GuardError, match="advanced_config"):
+            await tools_npm.npm_proxy_host_update(8, advanced_config=cfg)
+        with pytest.raises(GuardError, match="advanced_config"):
+            await tools_npm.npm_proxy_host_update(8, advanced_config=cfg, confirm=True)
+    assert put.call_count == 0
+    await tools_npm.npm_proxy_host_update(8, advanced_config="proxy_read_timeout 600s;", confirm=True)
+    assert json.loads(put.calls.last.request.read()) == {"advanced_config": "proxy_read_timeout 600s;"}
+
+
 async def test_proxy_host_update_no_change(npm_login):
     npm_login.get(f"{NPM_API}/nginx/proxy-hosts/8").respond(200, json=proxy_host(8, ["app.example.com"]))
     out = await tools_npm.npm_proxy_host_update(8, forward_port=8080, confirm=True)
@@ -348,14 +452,41 @@ def test_compose_privileged_rejected():
     "volumes",
     [
         "      - /var/run/docker.sock:/var/run/docker.sock\n",
+        "      - /var/run/docker.sock:/var/run/docker.sock:ro\n",
         "      - type: bind\n        source: /run/docker.sock\n        target: /var/run/docker.sock\n",
+        "      - /var/run/../run/docker.sock:/var/run/docker.sock\n",
     ],
 )
-def test_compose_docker_socket_needs_flag(volumes):
+def test_compose_docker_socket_needs_server_setting(volumes, monkeypatch):
+    """Docker-Socket nur über die Server-Einstellung ALLOW_DOCKER_SOCKET_STACKS, nie per Tool-Parameter."""
     compose = "services:\n  a:\n    image: x\n    volumes:\n" + volumes
-    with pytest.raises(GuardError, match="allow_docker_socket"):
+    unnormalized = ".." in volumes  # '..' wird immer abgelehnt, unabhängig von der Einstellung
+    with pytest.raises(GuardError, match="'\\.\\.'" if unnormalized else "ALLOW_DOCKER_SOCKET_STACKS"):
         guard.validate_compose(compose)
-    assert guard.validate_compose(compose, allow_docker_socket=True)["services"]["a"]
+    monkeypatch.setenv("ALLOW_DOCKER_SOCKET_STACKS", "true")
+    config.reset()
+    if unnormalized:
+        with pytest.raises(GuardError, match="'\\.\\.'"):
+            guard.validate_compose(compose)
+    else:
+        # Auch ohne BIND_MOUNT_ALLOWED_PREFIXES erlaubt, sobald serverseitig freigeschaltet
+        assert guard.validate_compose(compose)["services"]["a"]
+
+
+def test_compose_docker_socket_parameter_removed():
+    import inspect
+
+    from infra_mcp import tools_workflow
+
+    for fn in (
+        tools_portainer.portainer_stack_create,
+        tools_portainer.portainer_stack_create_git,
+        tools_portainer.portainer_stack_update,
+        tools_workflow.infra_publish_service,
+    ):
+        assert "allow_docker_socket" not in inspect.signature(fn).parameters
+    with pytest.raises(TypeError):
+        guard.validate_compose("services:\n  a:\n    image: x\n", allow_docker_socket=True)
 
 
 def test_compose_without_services():
@@ -387,6 +518,14 @@ def test_container_ref_validation(bad):
 # ---------------------------------------------------------------------------
 
 
+@pytest.fixture
+def bind_allowlist(monkeypatch):
+    """Betreiber gibt /srv/stacks und /home/deploy (read-write), /etc/localtime und /var/lib/docker
+    (sensibel, nur ro) sowie /var und /opt (weit gefasst) frei."""
+    monkeypatch.setenv("BIND_MOUNT_ALLOWED_PREFIXES", "/srv/stacks, /etc/localtime,/var/lib/docker,/var,/home/deploy,/opt")
+    config.reset()
+
+
 @pytest.mark.parametrize("extra,match", [
     ("    cap_add: [SYS_ADMIN]\n", "cap_add"),
     ("    devices: ['/dev/sda:/dev/sda']\n", "devices"),
@@ -395,11 +534,11 @@ def test_container_ref_validation(bad):
     ("    pid: host\n", "pid"),
     ("    network_mode: host\n", "network_mode"),
     ("    userns_mode: host\n", "userns_mode"),
-    ("    volumes:\n      - /:/host\n", "read-only"),
+    ("    volumes:\n      - /:/host\n", "nicht erlaubt"),
     ("    volumes:\n      - /etc:/hostetc:rw\n", "read-only"),
     ("    volumes:\n      - type: bind\n        source: /var/lib/docker\n        target: /d\n", "read-only"),
 ])
-def test_compose_escape_options_rejected(extra, match):
+def test_compose_escape_options_rejected(extra, match, bind_allowlist):
     with pytest.raises(GuardError, match=match):
         guard.validate_compose("services:\n  a:\n    image: x\n" + extra)
 
@@ -407,15 +546,152 @@ def test_compose_escape_options_rejected(extra, match):
 @pytest.mark.parametrize("extra", [
     "    security_opt: ['no-new-privileges:true']\n",
     "    security_opt:\n      - no-new-privileges\n",
-    "    volumes:\n      - /:/host:ro,rslave\n",
     "    volumes:\n      - /etc/localtime:/etc/localtime:ro\n",
-    "    volumes:\n      - /srv/app/data:/data\n",
-    "    volumes:\n      - appdata:/data\n",
+    "    volumes:\n      - /var/lib/docker:/d:ro\n",
+    "    volumes:\n      - /srv/stacks/app/data:/data\n",
+    "    volumes:\n      - /srv/stacks:/data:rw\n",
+    "    volumes:\n      - /home/deploy/app:/data\n",
+    "    volumes:\n      - /opt/app:/x:ro\n",
+    "    volumes:\n      - type: bind\n        source: /srv/stacks/app\n        target: /data\n",
+    "    volumes:\n      - ./config:/config:ro\n",
+    "    volumes:\n      - appdata:/data\nvolumes:\n  appdata:\n",
+    "    volumes:\n      - appdata:/data\nvolumes:\n  appdata: {}\n",
+    "    volumes:\n      - appdata:/data\nvolumes:\n  appdata:\n    driver: local\n    labels: [x=y]\n",
+    "    volumes:\n      - type: volume\n        source: appdata\n        target: /data\nvolumes:\n  appdata:\n",
+    "    volumes:\n      - type: tmpfs\n        target: /tmp\n",
+    "    volumes:\n      - /data\n",
+    "    tmpfs: [/run]\n",
     "    network_mode: bridge\n",
+    "    network_mode: none\n",
     "    cap_drop: [ALL]\n",
+    "    sysctls:\n      net.core.somaxconn: 1024\n      net.ipv4.ip_unprivileged_port_start: 0\n",
+    "    sysctls:\n      - net.ipv4.tcp_syncookies=1\n",
+    "    ulimits:\n      nofile:\n        soft: 65536\n        hard: 65536\n      nproc: 4096\n",
+    "    env_file: .env\n",
+    "    env_file: [./app.env]\n",
 ])
-def test_compose_safe_options_allowed(extra):
+def test_compose_safe_options_allowed(extra, bind_allowlist):
     assert guard.validate_compose("services:\n  a:\n    image: x\n" + extra)
+
+
+# Umgehungen aus dem Security-Review: jede einzelne muss jetzt abgelehnt werden.
+@pytest.mark.parametrize("extra,match", [
+    # Docker-Socket über Verzeichnis-Mount read-only (ro verhindert kein connect())
+    ("    volumes:\n      - /var/run:/h:ro\n", "auch nicht read-only"),
+    ("    volumes:\n      - /run:/h:ro\n", "auch nicht read-only"),
+    ("    volumes:\n      - /run/containerd:/h:ro\n", "auch nicht read-only"),
+    ("    volumes:\n      - /:/host:ro,rslave\n", "auch nicht read-only"),
+    ("    volumes:\n      - type: bind\n        source: /\n        target: /host\n        read_only: true\n", "auch nicht read-only"),
+    # fehlende Pfad-Normalisierung
+    ("    volumes:\n      - /home/../etc:/x\n", "'\\.\\.'"),
+    ("    volumes:\n      - /srv/stacks/../../etc:/x\n", "'\\.\\.'"),
+    ("    volumes:\n      - /opt/../var/lib/docker:/x\n", "'\\.\\.'"),
+    ("    volumes:\n      - //etc:/x:ro\n", "ausserhalb"),
+    ("    volumes:\n      - /var/./lib/docker:/x:rw\n", "read-only"),
+    # kritische Host-Pfade read-write
+    ("    volumes:\n      - /var/spool/cron:/c\n", "read-only"),
+    ("    volumes:\n      - /var/spool/cron/crontabs:/c:rw\n", "read-only"),
+    ("    volumes:\n      - /var/lib/portainer:/p\n", "read-only"),
+    ("    volumes:\n      - /var/lib/containerd:/p\n", "read-only"),
+    # weit gefasste Pfade: Allowlist "/opt" allein reicht nicht für read-write
+    ("    volumes:\n      - /opt/app:/x\n", "unterhalb von /opt"),
+    ("    volumes:\n      - /opt:/x:rw\n", "unterhalb von /opt"),
+    # ausserhalb der Allowlist
+    ("    volumes:\n      - /home:/h\n", "ausserhalb"),
+    ("    volumes:\n      - /home/other:/h:ro\n", "ausserhalb"),
+    ("    volumes:\n      - /srv/app/data:/data\n", "ausserhalb"),
+    ("    volumes:\n      - /srv/stacksfoo:/data\n", "ausserhalb"),
+    ("    volumes:\n      - /etc/localtime2:/x:ro\n", "ausserhalb"),
+    ("    volumes:\n      - /etc/ssh:/x:ro\n", "ausserhalb"),
+    # volumes_from, externe/fremde Volumes
+    ("    volumes_from: [portainer]\n", "volumes_from"),
+    ("    volumes:\n      - portainer_data:/data\nvolumes:\n  portainer_data:\n    external: true\n", "external"),
+    ("    volumes:\n      - pd:/data\nvolumes:\n  pd:\n    name: portainer_data\n", "name"),
+    ("    volumes:\n      - appdata:/data\n", "nicht im Top-level-Abschnitt"),
+    ("    volumes:\n      - type: volume\n        source: appdata\n        target: /data\n", "nicht im Top-level-Abschnitt"),
+    # versteckter Bind-Mount über driver_opts
+    ("    volumes:\n      - etc:/x\nvolumes:\n  etc:\n    driver: local\n    driver_opts:\n      type: none\n      device: /etc\n      o: bind\n", "driver_opts"),
+    ("    volumes:\n      - nfs:/x\nvolumes:\n  nfs:\n    driver: nfs-plugin\n", "driver"),
+    # Namespace-Join auf fremde Container, cgroup
+    ("    pid: container:npm\n", "pid"),
+    ("    pid: 'service:other'\n", "pid"),
+    ("    network_mode: container:portainer\n", "network_mode"),
+    ("    ipc: container:abc\n", "ipc"),
+    ("    cgroup: host\n", "cgroup"),
+    ("    userns_mode: container:x\n", "userns_mode"),
+    ("    cgroup_parent: /docker/other.slice\n", "cgroup_parent"),
+    # sysctls / ulimits
+    ("    sysctls:\n      kernel.msgmax: 65536\n", "sysctl"),
+    ("    sysctls:\n      - fs.file-max=1\n", "sysctl"),
+    ("    ulimits:\n      nofile: -1\n", "ulimit"),
+    ("    ulimits:\n      memlock:\n        soft: -1\n        hard: -1\n", "ulimit"),
+    ("    ulimits:\n      nproc: 1000000\n", "Maximum"),
+    # Dateizugriffe ausserhalb des Projektverzeichnisses
+    ("    volumes:\n      - ../other-stack:/x\n", "verlässt"),
+    ("    volumes:\n      - ./a/../../x:/x\n", "verlässt"),
+    ("    volumes:\n      - ~/.ssh:/x\n", "Home-Verzeichnis"),
+    ("    env_file: /etc/shadow\n", "env_file"),
+    ("    env_file: [../../x.env]\n", "env_file"),
+    ("    extends:\n      file: ../../other.yml\n      service: x\n", "extends"),
+    # Variablen würden die Prüfung erst beim Deploy aushebeln
+    ("    privileged: ${PRIV}\n", "Variablen"),
+    ("    pid: ${NS}\n", "Variablen"),
+    ("    volumes:\n      - ${DATA}:/data\n", "Variablen"),
+    ("    volumes:\n      - type: bind\n        source: $HOME\n        target: /data\n", "Variablen"),
+])
+def test_compose_review_bypasses_rejected(extra, match, bind_allowlist):
+    with pytest.raises(GuardError, match=match):
+        guard.validate_compose("services:\n  a:\n    image: x\n" + extra)
+
+
+def test_compose_top_level_secret_file_rejected(bind_allowlist):
+    with pytest.raises(GuardError, match="secrets 'db'"):
+        guard.validate_compose("services:\n  a:\n    image: x\nsecrets:\n  db:\n    file: /data/portainer.db\n")
+    with pytest.raises(GuardError, match="configs 'c'"):
+        guard.validate_compose("services:\n  a:\n    image: x\nconfigs:\n  c:\n    file: ../x\n")
+    assert guard.validate_compose("services:\n  a:\n    image: x\nsecrets:\n  db:\n    file: ./db.txt\n")
+
+
+def test_compose_no_bind_mounts_without_allowlist():
+    """Fail-safe: ohne BIND_MOUNT_ALLOWED_PREFIXES ist kein Host-Pfad erlaubt, auch nicht read-only."""
+    assert not config.settings().bind_mount_allowed_prefixes
+    for vol in ("/srv/stacks/app:/data", "/etc/localtime:/etc/localtime:ro", "/tmp/x:/x:ro"):
+        with pytest.raises(GuardError, match="BIND_MOUNT_ALLOWED_PREFIXES ist leer"):
+            guard.validate_compose(f"services:\n  a:\n    image: x\n    volumes:\n      - {vol}\n")
+    assert guard.validate_compose("services:\n  a:\n    image: x\n    volumes:\n      - d:/data\nvolumes:\n  d:\n")
+
+
+def test_compose_guarded_paths_need_explicit_prefix(monkeypatch):
+    """/home, /opt, /srv read-write nur, wenn die Allowlist ein Verzeichnis darunter nennt."""
+    compose = "services:\n  a:\n    image: x\n    volumes:\n      - /opt/app/data:/data\n"
+    monkeypatch.setenv("BIND_MOUNT_ALLOWED_PREFIXES", "/opt/app")
+    config.reset()
+    assert guard.validate_compose(compose)
+    monkeypatch.setenv("BIND_MOUNT_ALLOWED_PREFIXES", "/opt")
+    config.reset()
+    with pytest.raises(GuardError, match="unterhalb von /opt"):
+        guard.validate_compose(compose)
+    assert guard.validate_compose(compose.replace("/data\n", "/data:ro\n"))
+    # Allowlist "/" wird verworfen (fail-safe) -> gar keine Bind-Mounts
+    monkeypatch.setenv("BIND_MOUNT_ALLOWED_PREFIXES", "/, relative/path, /x/../..")
+    config.reset()
+    assert config.settings().bind_mount_allowed_prefixes == ()
+    with pytest.raises(GuardError, match="BIND_MOUNT_ALLOWED_PREFIXES ist leer"):
+        guard.validate_compose(compose)
+
+
+def test_compose_allowlist_normalized(monkeypatch):
+    monkeypatch.setenv("BIND_MOUNT_ALLOWED_PREFIXES", "/srv/stacks/,//srv//stacks/./app")
+    config.reset()
+    assert config.settings().bind_mount_allowed_prefixes == ("/srv/stacks", "/srv/stacks/app")
+
+
+async def test_stack_create_preview_shows_compose_rejection(mock):
+    """Auch die Vorschau ohne confirm lehnt ab, und Portainer wird nicht angefragt."""
+    compose = "services:\n  a:\n    image: x\n    volumes:\n      - /var/run:/h:ro\n"
+    with pytest.raises(GuardError, match="auch nicht read-only"):
+        await tools_portainer.portainer_stack_create("new-stack", 1, compose)
+    assert not written(mock)
 
 
 # ---------------------------------------------------------------------------

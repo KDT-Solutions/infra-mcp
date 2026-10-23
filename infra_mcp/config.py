@@ -6,8 +6,12 @@ Umgebung bzw. den Portainer-Stack-Variablen und werden nie ins Image gebaut.
 
 from __future__ import annotations
 
+import logging
 import os
+import posixpath
 from dataclasses import dataclass
+
+logger = logging.getLogger("infra_mcp.config")
 
 # Diese Muster gelten immer, zusätzlich zu den Werten aus PROTECTED_CONTAINERS /
 # PROTECTED_STACKS. Ein gesetzter Env-Wert kann sie also nicht versehentlich aufheben.
@@ -42,6 +46,25 @@ def _merge(defaults: tuple[str, ...], extra: tuple[str, ...]) -> tuple[str, ...]
     return tuple(out)
 
 
+def _bind_prefixes(value: str | None) -> tuple[str, ...]:
+    """BIND_MOUNT_ALLOWED_PREFIXES: absolute, normalisierte Basisverzeichnisse für Bind-Mounts.
+    Fail-safe: ungültige Einträge (relativ, mit '..', oder '/' = alles) werden verworfen und
+    geloggt, statt die Prüfung zu weiten."""
+    out: list[str] = []
+    for raw in (value or "").split(","):
+        p = raw.strip()
+        if not p:
+            continue
+        norm = posixpath.normpath(p)
+        norm = "/" + norm.lstrip("/") if norm.startswith("/") else norm
+        if not norm.startswith("/") or norm == "/" or ".." in norm.split("/"):
+            logger.warning("BIND_MOUNT_ALLOWED_PREFIXES: Eintrag %r ignoriert (muss absolut, ohne '..' und nicht '/' sein).", p)
+            continue
+        if norm not in out:
+            out.append(norm)
+    return tuple(out)
+
+
 @dataclass(frozen=True)
 class Settings:
     portainer_url: str
@@ -62,6 +85,11 @@ class Settings:
     metrics_file: str = ""
     docker_host_ip: str = ""
     git_allowed_repo_prefixes: tuple[str, ...] = ()
+    # Docker-Socket-Mounts in Stacks nur, wenn der Betreiber das serverseitig freischaltet.
+    # Kein Tool-Parameter: der Client (das Modell) darf sich das nicht selbst erlauben.
+    allow_docker_socket_stacks: bool = False
+    # Bind-Mounts nur unterhalb dieser Basisverzeichnisse. Leer = keine Bind-Mounts.
+    bind_mount_allowed_prefixes: tuple[str, ...] = ()
 
     def secret_values(self) -> tuple[str, ...]:
         """Werte, die in keiner Ausgabe und keinem Log auftauchen dürfen."""
@@ -91,6 +119,8 @@ def load_settings() -> Settings:
         git_allowed_repo_prefixes=tuple(
             p.strip().rstrip("/").lower() + "/" for p in env.get("GIT_ALLOWED_REPO_PREFIXES", "").split(",") if p.strip()
         ),
+        allow_docker_socket_stacks=_bool(env.get("ALLOW_DOCKER_SOCKET_STACKS"), False),
+        bind_mount_allowed_prefixes=_bind_prefixes(env.get("BIND_MOUNT_ALLOWED_PREFIXES")),
     )
 
 

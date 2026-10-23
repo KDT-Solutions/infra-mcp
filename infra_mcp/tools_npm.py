@@ -128,7 +128,10 @@ async def build_create_payload(
     hsts: bool,
     access_list_id: int | None,
     advanced_config: str | None,
+    locations: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
+    # advanced_config wird 1:1 nginx-Konfiguration: nur Direktiven aus der Allowlist (guard),
+    # sonst GuardError - auch in der Vorschau ohne confirm.
     payload: dict[str, Any] = {
         "domain_names": domains,
         "forward_scheme": scheme,
@@ -138,14 +141,14 @@ async def build_create_payload(
         "block_exploits": bool(block_exploits),
         "caching_enabled": False,
         "access_list_id": int(access_list_id) if access_list_id else 0,
-        "advanced_config": advanced_config or "",
+        "advanced_config": guard.validate_advanced_config(advanced_config),
         "certificate_id": "new" if ssl else 0,
         "ssl_forced": bool(ssl),
         "http2_support": bool(ssl and http2),
         "hsts_enabled": bool(ssl and hsts),
         "hsts_subdomains": False,
         "meta": {},
-        "locations": [],
+        "locations": guard.validate_locations(locations),
     }
     if ssl:
         if await npm().legacy_letsencrypt_meta():
@@ -339,7 +342,10 @@ async def npm_proxy_host_create(
 ) -> dict[str, Any]:
     """Proxy-Host anlegen. Duplikate werden verhindert. Bei ssl=true muss jede
     Domain auf PUBLIC_IP auflösen, sonst Abbruch; dann wird ein Let's-Encrypt-
-    Zertifikat angefordert und ssl_forced gesetzt. Ohne confirm=true nur Vorschau."""
+    Zertifikat angefordert und ssl_forced gesetzt. advanced_config: nur einzelne
+    nginx-Direktiven aus der Allowlist (add_header, expires, client_max_body_size,
+    proxy_*_timeout, proxy_buffer*, gzip*, real_ip_header, set_real_ip_from), keine
+    Blöcke, kein location/proxy_pass/alias/root/include. Ohne confirm=true nur Vorschau."""
     domains = guard.validate_domains(domain_names)
     scheme, host, port = guard.validate_forward(forward_scheme, forward_host, forward_port)
     checks = await precheck_proxy_host_create(domains, ssl)
@@ -384,9 +390,12 @@ async def npm_proxy_host_update(
     confirm: bool = False,
 ) -> dict[str, Any]:
     """Proxy-Host ändern - nur die übergebenen Felder. Holt den aktuellen Stand
-    und zeigt den Diff. Geschützte Domains werden blockiert. Ohne confirm=true nur Vorschau."""
+    und zeigt den Diff. Geschützte Domains werden blockiert. advanced_config nur mit
+    Direktiven aus der Allowlist (wie bei npm_proxy_host_create). Ohne confirm=true nur Vorschau."""
     guard.require_protected_domains_configured()
     host_id = guard.validate_positive_id(id, "id")
+    if advanced_config is not None:
+        advanced_config = guard.validate_advanced_config(advanced_config)
     current = await npm().proxy_host(host_id)
     guard.block(guard.domain_protection(current.get("domain_names") or []))
 
