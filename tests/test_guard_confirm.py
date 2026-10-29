@@ -296,13 +296,14 @@ def test_advanced_config_rejected(cfg, match):
 
 
 def test_locations_advanced_config_checked():
+    fwd = {"forward_scheme": "http", "forward_host": "app", "forward_port": 8080}
     with pytest.raises(GuardError, match=r"locations\[1\]\.advanced_config.*proxy_pass"):
         guard.validate_locations([
-            {"path": "/a", "advanced_config": "expires 1d;"},
-            {"path": "/b", "advanced_config": "proxy_pass http://127.0.0.1:81;"},
+            {"path": "/a", **fwd, "advanced_config": "expires 1d;"},
+            {"path": "/b", **fwd, "advanced_config": "proxy_pass http://127.0.0.1:81;"},
         ])
-    out = guard.validate_locations([{"path": "/a", "advanced_config": None}])
-    assert out == [{"path": "/a", "advanced_config": ""}]
+    out = guard.validate_locations([{"path": "/a", **fwd, "advanced_config": None}])
+    assert out == [{"path": "/a", **fwd, "forward_path": "", "advanced_config": ""}]
 
 
 async def test_proxy_host_create_preview_rejects_advanced_config(npm_login, dns_ok):

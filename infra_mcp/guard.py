@@ -347,23 +347,117 @@ def validate_advanced_config(text: str | None, label: str = "advanced_config") -
     return "\n".join(out).strip()
 
 
-def validate_locations(locations: Any) -> list[dict[str, Any]]:
-    """locations[].advanced_config gleich prüfen wie advanced_config."""
+# ---------------------------------------------------------------------------
+# NPM Custom Locations
+# ---------------------------------------------------------------------------
+
+# NPM setzt path, forward_* und advanced_config ungeprüft in "location {{ path }} { ... proxy_pass
+# {{ forward_scheme }}://{{ forward_host }}:{{ forward_port }}{{ forward_path }}; }" ein. Der Pfad
+# lässt deshalb nur ein festes Zeichenset zu: kein "/" allein (ersetzt die Standard-Location des
+# Hosts), keine nginx-Modifikatoren (=, ~, ~*, ^~), keine Leerzeichen, { } ; $ \ ` ".
+LOCATIONS_MAX = 20
+LOCATION_PATH_MAX_CHARS = 100
+_LOCATION_PATH_RE = re.compile(r"^/[A-Za-z0-9._~-]+(/[A-Za-z0-9._~-]+)*/?$")
+_LOCATION_KEYS = ("path", "forward_scheme", "forward_host", "forward_port", "forward_path", "advanced_config", "access_list_id")
+LOCATION_FORBIDDEN_HOSTS = ("127.0.0.1", "localhost", "::1", "0.0.0.0")
+LOCATION_FORBIDDEN_PORTS = {81: "NPM-Admin-API", 9000: "Portainer", 9443: "Portainer"}
+
+
+def validate_location_path(value: Any, label: str = "path") -> str:
+    if not isinstance(value, str):
+        raise GuardError(f"{label} muss ein Text sein.")
+    if len(value) > LOCATION_PATH_MAX_CHARS:
+        raise GuardError(f"{label}: maximal {LOCATION_PATH_MAX_CHARS} Zeichen erlaubt.")
+    if not _LOCATION_PATH_RE.match(value):
+        raise GuardError(
+            f"{label} {value[:80]!r} ist nicht erlaubt: nur '/segment[/segment...]' mit A-Z, a-z, 0-9, '.', '_', '~', '-' "
+            "(nicht '/' allein, keine nginx-Modifikatoren, keine Leer- oder Sonderzeichen)."
+        )
+    if ".." in value.split("/"):
+        raise GuardError(f"{label} {value!r} enthält '..' und ist nicht erlaubt.")
+    return value
+
+
+def validate_location(loc: Any, label: str) -> dict[str, Any]:
+    """Eine Location prüfen und normalisiert zurückgeben. Das Ziel (DOCKER_HOST_IP bzw.
+    Container im NPM-Netz) prüft tools_npm, weil dafür Portainer abgefragt wird."""
+    if not isinstance(loc, dict):
+        raise GuardError(f"{label} muss ein Objekt sein.")
+    unknown = sorted(str(k) for k in loc if k not in _LOCATION_KEYS)
+    if unknown:
+        raise GuardError(f"{label}: unbekannte Felder {unknown}. Erlaubt: {', '.join(_LOCATION_KEYS)}.")
+    path = validate_location_path(loc.get("path"), f"{label}.path")
+    try:
+        scheme, host, port = validate_forward(loc.get("forward_scheme"), loc.get("forward_host"), loc.get("forward_port"))
+    except GuardError as exc:
+        raise GuardError(f"{label}: {exc}") from None
+    if host.lower() in LOCATION_FORBIDDEN_HOSTS:
+        raise GuardError(f"{label}: forward_host {host} ist nicht erlaubt.")
+    if port in LOCATION_FORBIDDEN_PORTS:
+        raise GuardError(f"{label}: forward_port {port} ({LOCATION_FORBIDDEN_PORTS[port]}) ist gesperrt.")
+    forward_path = loc.get("forward_path") or ""
+    if forward_path:
+        forward_path = validate_location_path(forward_path, f"{label}.forward_path")
+    item: dict[str, Any] = {
+        "path": path,
+        "forward_scheme": scheme,
+        "forward_host": host,
+        "forward_port": port,
+        "forward_path": forward_path,
+        "advanced_config": validate_advanced_config(loc.get("advanced_config"), f"{label}.advanced_config"),
+    }
+    if loc.get("access_list_id") is not None:
+        try:
+            acl = int(loc["access_list_id"])
+        except (TypeError, ValueError):
+            raise GuardError(f"{label}.access_list_id muss eine Ganzzahl >= 0 sein.") from None
+        if acl < 0 or isinstance(loc["access_list_id"], bool):
+            raise GuardError(f"{label}.access_list_id muss eine Ganzzahl >= 0 sein.")
+        item["access_list_id"] = acl
+    return item
+
+
+def validate_locations(locations: Any, label: str = "locations") -> list[dict[str, Any]]:
+    """Liste von Locations prüfen: Pfad, Ziel, advanced_config (Allowlist), Pfade eindeutig, max. 20."""
     if not locations:
         return []
     if not isinstance(locations, list):
-        raise GuardError("locations muss eine Liste sein.")
-    out = []
+        raise GuardError(f"{label} muss eine Liste sein.")
+    if len(locations) > LOCATIONS_MAX:
+        raise GuardError(f"{label}: höchstens {LOCATIONS_MAX} Locations pro Host.")
+    out: list[dict[str, Any]] = []
     for i, loc in enumerate(locations):
-        if not isinstance(loc, dict):
-            raise GuardError(f"locations[{i}] muss ein Objekt sein.")
-        item = dict(loc)
-        item["advanced_config"] = validate_advanced_config(loc.get("advanced_config"), f"locations[{i}].advanced_config")
+        item = validate_location(loc, f"{label}[{i}]")
+        if any(o["path"] == item["path"] for o in out):
+            raise GuardError(f"{label}: Pfad {item['path']} kommt mehrfach vor.")
         out.append(item)
     return out
 
 
+def location_target(loc: dict[str, Any]) -> str:
+    return f"{loc.get('forward_scheme')}://{loc.get('forward_host')}:{loc.get('forward_port')}{loc.get('forward_path') or ''}"
+
+
+def summarize_locations(locations: Any) -> Any:
+    """Locations fürs Log: nur Pfad und Ziel, advanced_config nur als Länge."""
+    if not isinstance(locations, list):
+        return None if locations is None else {"type": type(locations).__name__}
+    out = []
+    for loc in locations:
+        if not isinstance(loc, dict):
+            out.append({"type": type(loc).__name__})
+            continue
+        adv = loc.get("advanced_config")
+        out.append({
+            "path": redact_text(str(loc.get("path")))[:120],
+            "target": redact_text(location_target(loc))[:300],
+            "advanced_config": {"chars": len(adv) if isinstance(adv, str) else 0},
+        })
+    return out
+
+
 _PARAM_SUMMARY_KEYS = {"compose_content", "advanced_config"}
+_PARAM_LOCATION_KEYS = {"locations", "locations_set"}
 
 
 def redact_params(params: dict[str, Any]) -> dict[str, Any]:
@@ -372,6 +466,8 @@ def redact_params(params: dict[str, Any]) -> dict[str, Any]:
     for k, v in params.items():
         if k in _PARAM_SUMMARY_KEYS:
             out[k] = {"chars": len(v)} if isinstance(v, str) else None
+        elif k in _PARAM_LOCATION_KEYS:
+            out[k] = summarize_locations(v)
         elif k in ("env", "env_set"):
             out[k] = {"names": env_names(v)}
         elif is_secret_name(k):

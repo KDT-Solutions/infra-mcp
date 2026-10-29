@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.6.1
+
+- **Custom Locations für NPM-Proxy-Hosts:** `npm_proxy_host_update` hat die neuen Parameter `locations_set` (gleicher `path` ersetzt, sonst neu) und `locations_remove` (Pfade). Nicht genannte Locations bleiben unverändert inklusive `id`. Gesendet wird ein PUT nur mit dem Feld `locations` und der vollständigen, zusammengeführten Liste, da NPM die Liste damit komplett ersetzt. Nicht kombinierbar mit den übrigen Feldern in einem Aufruf.
+- `npm_proxy_host_create` gibt den Parameter `locations` frei, mit denselben Prüfungen.
+- Prüfungen (auch in der Vorschau): Pfad nach fester Regex, max. 100 Zeichen, kein `/` allein, kein `..`, keine nginx-Modifikatoren, Pfade eindeutig, max. 20 Locations. Ziel nur `DOCKER_HOST_IP` mit einem von einem sichtbaren Container veröffentlichten Port oder ein Container im NPM-Netz; nie Loopback oder `0.0.0.0`, Ports 81, 9000, 9443 gesperrt. `forward_path` wie Pfad, `advanced_config` über die Allowlist, unbekannte Felder abgelehnt.
+- `access_list_id` einer Location wird nur gesendet, wenn das Schema der Instanz das Feld kennt (NPM v2.16.0, nicht v2.12.6).
+- Nach dem Schreiben: gespeicherte Locations und `meta.nginx_online` geprüft. Bei nginx-Fehler werden die vorherigen Locations einmal automatisch zurückgeschrieben; die Antwort enthält `nginx_err` und das Ergebnis der Wiederherstellung, bei Misserfolg eine Warnung, dass der Host offline ist.
+- Vorschau mit Diff pro Location (`neu`/`geändert`/`entfernt`), Audit-Einträge `proxy_host_location_change` und `proxy_host_location_restore`, Tool-Log nur mit Pfad und Ziel.
+- `npm_proxy_host_get` zeigt bei Locations auch `forward_path` und `access_list_id`.
+- README: Tabelle "NPM - schreibend" repariert (die Allowlist-Liste stand mitten in der Tabelle).
+
 ## 0.6.0
 
 Sicherheits-Release nach Security-Review (drei hohe Befunde). **Breaking:** der Tool-Parameter `allow_docker_socket` entfällt, Bind-Mounts brauchen neu eine Allowlist, `advanced_config` ist auf nginx-Direktiven aus einer Allowlist beschränkt.

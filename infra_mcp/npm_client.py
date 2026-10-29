@@ -193,6 +193,29 @@ class NpmClient:
         text = schema if isinstance(schema, str) else json.dumps(schema)
         return "letsencrypt_email" in text
 
+    async def location_access_list_supported(self) -> bool:
+        """True, wenn das Location-Objekt im Schema der Instanz access_list_id kennt (ab v2.16.0).
+        v2.12.6 lehnt das Feld ab (additionalProperties: false). GET /api/schema liefert das
+        aufgelöste Schema; gesucht wird das Objekt mit path und forward_path in properties."""
+        schema = await self._request("GET", "/schema")
+        if isinstance(schema, str):
+            try:
+                schema = json.loads(schema)
+            except ValueError:
+                return False
+
+        def walk(node: Any) -> bool:
+            if isinstance(node, dict):
+                props = node.get("properties")
+                if isinstance(props, dict) and "path" in props and "forward_path" in props and "access_list_id" in props:
+                    return True
+                return any(walk(v) for v in node.values())
+            if isinstance(node, list):
+                return any(walk(v) for v in node)
+            return False
+
+        return walk(schema)
+
     async def proxy_hosts(self) -> list[dict[str, Any]]:
         return await self._request("GET", "/nginx/proxy-hosts", params={"expand": "certificate,access_list"}) or []
 

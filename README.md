@@ -102,7 +102,7 @@ Hinweis: Portainer selbst lehnt `security_opt` für Nicht-Administratoren ab, so
 |---|---|
 | `npm_version` | NPM-Version (`GET /api/`) |
 | `npm_proxy_host_list(filter)` | id, Domains, Forward-Ziel, enabled, Zertifikat inkl. Ablauf, ssl_forced |
-| `npm_proxy_host_get(id_or_domain)` | Ein Proxy-Host mit allen Einstellungen, `advanced_config` geschwärzt |
+| `npm_proxy_host_get(id_or_domain)` | Ein Proxy-Host mit allen Einstellungen inkl. Custom Locations (Pfad, Ziel), `advanced_config` geschwärzt |
 | `npm_certificate_list` | Ablaufdatum, `expiring_soon` bei weniger als 14 Tagen |
 | `npm_redirection_host_list`, `npm_stream_list`, `npm_access_list_list`, `npm_host_report` | Übersichten (Access-Lists ohne Benutzer/Passwörter) |
 
@@ -110,8 +110,12 @@ Hinweis: Portainer selbst lehnt `security_opt` für Nicht-Administratoren ab, so
 
 | Tool | Beschreibung |
 |---|---|
-| `npm_proxy_host_create(domain_names, forward_scheme, forward_host, forward_port, websocket=false, block_exploits=true, ssl=true, http2=true, hsts=false, access_list_id, advanced_config, confirm)` | Duplikate (Proxy- und Redirection-Hosts) werden verhindert. Bei `ssl=true` muss jede Domain auf `PUBLIC_IP` auflösen, sonst Abbruch. Fordert ein Let's-Encrypt-Zertifikat an und setzt danach `ssl_forced` |
+| `npm_proxy_host_create(domain_names, forward_scheme, forward_host, forward_port, websocket=false, block_exploits=true, ssl=true, http2=true, hsts=false, access_list_id, advanced_config, locations, confirm)` | Duplikate (Proxy- und Redirection-Hosts) werden verhindert. Bei `ssl=true` muss jede Domain auf `PUBLIC_IP` auflösen, sonst Abbruch. Fordert ein Let's-Encrypt-Zertifikat an und setzt danach `ssl_forced`. `locations`: Custom Locations, gleiche Prüfungen wie unten |
 | `npm_proxy_host_update(id, <nur geänderte Felder>, confirm)` | Holt den aktuellen Stand und zeigt den Diff |
+| `npm_proxy_host_update(id, locations_set, locations_remove, confirm)` | Custom Locations anlegen, ersetzen (gleicher `path`) oder per Pfad entfernen. Alle übrigen Locations und Einstellungen des Hosts bleiben unverändert. Nicht zusammen mit den übrigen Feldern in einem Aufruf. Details unter Custom Locations |
+| `npm_proxy_host_enable` / `npm_proxy_host_disable(id, confirm)` | Aktivieren/deaktivieren (nicht löschen) |
+| `npm_certificate_renew(id, confirm)` | Let's-Encrypt-Zertifikat erneuern |
+
 
 `advanced_config` (auch `locations[].advanced_config`) landet 1:1 in der nginx-Konfiguration des NPM-Containers und ist deshalb auf eine Allowlist beschränkt - auch in der Vorschau ohne `confirm`:
 
@@ -120,8 +124,46 @@ Hinweis: Portainer selbst lehnt `security_opt` für Nicht-Administratoren ab, so
 - `add_header`: Name aus `[A-Za-z0-9_-]`, Wert ohne Zeilenumbruch und ohne `;` (auch nicht in Anführungszeichen), optional `always`
 - damit ausgeschlossen: `location`, `proxy_pass` (z.B. auf die NPM-Admin-API `127.0.0.1:81` oder Portainer), `alias`/`root` (z.B. `/data`, `/etc/letsencrypt`), `include`, `return`, `rewrite`, `auth_*`, `lua_*`/`*_by_lua*`, `ssl_*`
 - maximal 4000 Zeichen und 60 Zeilen
-| `npm_proxy_host_enable` / `npm_proxy_host_disable(id, confirm)` | Aktivieren/deaktivieren (nicht löschen) |
-| `npm_certificate_renew(id, confirm)` | Let's-Encrypt-Zertifikat erneuern |
+
+### Custom Locations
+
+Eine Location leitet einen Pfad eines bestehenden Proxy-Hosts an ein anderes Ziel weiter, z.B. `/app` auf `http://192.0.2.25:8438`. Sie übernimmt vom Host Zugriffsliste, SSL-Zwang, HSTS, `block_exploits` und WebSocket; die `advanced_config` des Hosts steht auf Server-Ebene und gilt auch für die Locations.
+
+Eine Location ist ein Objekt mit `path`, `forward_scheme`, `forward_host`, `forward_port` und optional `forward_path`, `advanced_config`, `access_list_id`. Andere Felder werden abgelehnt.
+
+- `locations_set`: Eine vorhandene Location mit gleichem `path` wird ersetzt (ihre `id` bleibt), sonst wird die neue angehängt.
+- `locations_remove`: Pfade, die entfernt werden. Ein Pfad, den der Host nicht hat, wird abgelehnt.
+- Alle nicht genannten Locations werden unverändert übernommen, inklusive `id`. Die Liste lässt sich nicht als Ganzes überschreiben.
+
+NPM ersetzt bei `PUT /api/nginx/proxy-hosts/{id}` die gespeicherte Liste `locations` komplett, wenn das Feld im Body steht (geprüft am Quellcode v2.12.6 und v2.16.0). infra-mcp liest deshalb den aktuellen Stand, baut daraus die vollständige Liste und schickt einen PUT, der nur `locations` enthält. Die übrigen Felder des Hosts gehen nicht mit.
+
+Prüfungen (auch in der Vorschau ohne `confirm`, Verstoss = Abbruch ohne Schreibzugriff):
+
+- `path`: `^/[A-Za-z0-9._~-]+(/[A-Za-z0-9._~-]+)*/?$`, max. 100 Zeichen, kein Segment `..`. Damit sind ausgeschlossen: `/` allein (würde die Standard-Location des Hosts ersetzen), nginx-Modifikatoren (`=`, `~`, `~*`, `^~`), Leerzeichen und `` { } ; $ \ ` " ``. Jeder Pfad nur einmal pro Host.
+- `forward_scheme` `http`/`https`, `forward_host` ohne `/` (sonst würde NPM den Rest still zum `forward_path` machen), `forward_port` 1-65535.
+- `forward_path`: leer oder gleiche Regel wie `path`.
+- Ziel: nur `DOCKER_HOST_IP` mit einem Port, den ein für `mcp` sichtbarer Container veröffentlicht, oder ein für `mcp` sichtbarer Container im NPM-Netz (`NPM_DOCKER_NETWORK`). Nie `127.0.0.1`, `localhost`, `::1`, `0.0.0.0`. Die Ports 81 (NPM-Admin-API), 9000 und 9443 (Portainer) sind immer gesperrt. Geprüft werden nur neue und geänderte Locations.
+- `advanced_config` einer Location: gleiche Allowlist wie beim Host.
+- `access_list_id`: wird nur gesendet, wenn das Schema der Instanz (`GET /api/schema`) das Feld im Location-Objekt kennt (ab v2.16.0). v2.12.6 lehnt es ab; dann wird es weggelassen und die Antwort enthält einen Hinweis.
+- Schutzliste: Locations auf Hosts mit geschützter Domain werden blockiert.
+- Höchstens 20 Locations pro Host.
+
+Die Vorschau zeigt pro Location `neu`, `geändert` oder `entfernt` mit Pfad und Ziel (bei `geändert` auch das bisherige Ziel), `advanced_config` geschwärzt, und die vollständige Liste danach.
+
+#### Verhalten bei nginx-Fehlern
+
+NPM testet die nginx-Konfiguration nach jeder Änderung. Schlägt der Test fehl, setzt NPM `meta.nginx_online = false` und `meta.nginx_err`, benennt die Config des Hosts in `.err` um und entfernt die laufende Config - der ganze Host ist dann offline. Deshalb mit `confirm=true`:
+
+1. aktuellen Stand lesen, vollständige Liste bauen,
+2. `PUT` nur mit `locations`,
+3. Host neu lesen und prüfen, dass die gespeicherten Locations den geschickten entsprechen und `meta.nginx_online` true ist,
+4. ist `nginx_online` false: einmal automatisch die vorherigen Locations zurückschreiben und erneut prüfen. Die Antwort enthält `nginx_err` (gekürzt auf 500 Zeichen) und das Ergebnis der Wiederherstellung (`restore`). Schlägt auch die Wiederherstellung fehl, steht in `warnung`, dass der Host offline ist,
+5. weichen die gespeicherten Locations ab, meldet die Antwort `ok: false` mit beiden Listen,
+6. Timeout beim `PUT`: Zustand unklar, keine automatische Wiederholung (wie bei den übrigen Schreibtools). Antwortet NPM mit einem Fehler, wird trotzdem der Ist-Zustand gelesen; sind die Locations unverändert, kommt der Fehler zurück.
+
+Ist der Host deaktiviert, schreibt NPM keine nginx-Config; `nginx_online` wird dann nicht ausgewertet.
+
+Audit-Log: pro geänderter Location ein Eintrag `proxy_host_location_change` (Host-ID, Domains, Pfad, Aktion, Ziel), bei automatischer Wiederherstellung zusätzlich `proxy_host_location_restore`. Im Tool-Log erscheinen von `locations`/`locations_set` nur Pfad und Ziel, `advanced_config` nur als Länge.
 
 ### Kombinierte Abläufe
 
@@ -296,4 +338,4 @@ pip install -r requirements-dev.txt
 pytest -q
 ```
 
-Abgedeckt: Host-Metriken und 24-h-Verlauf, Log-Demux, Schwärzung, NPM-Token-Erneuerung und 401-Wiederholung, Schutzlisten, Duplikat-Prüfung, DNS-Vorabprüfung, confirm-Logik, Compose-Prüfung, Bearer-Auth, Audit-Log und der Ablauf von `infra_publish_service` mit Fehlern in jedem Schritt.
+Abgedeckt: Host-Metriken und 24-h-Verlauf, Log-Demux, Schwärzung, NPM-Token-Erneuerung und 401-Wiederholung, Schutzlisten, Duplikat-Prüfung, DNS-Vorabprüfung, confirm-Logik, Compose-Prüfung, Bearer-Auth, Audit-Log, Custom Locations (Zusammenführen, Pfad- und Zielprüfung, `access_list_id` je nach Schema, nginx-Fehler mit Wiederherstellung) und der Ablauf von `infra_publish_service` mit Fehlern in jedem Schritt.

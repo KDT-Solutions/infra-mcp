@@ -162,6 +162,15 @@ async def find_stack_by_name(name: str) -> dict[str, Any] | None:
     return None
 
 
+def container_name(c: dict[str, Any]) -> str:
+    return ((c.get("Names") or ["/"])[0]).lstrip("/")
+
+
+def published_ports(c: dict[str, Any]) -> set[int]:
+    """Host-Ports, die ein Container (Eintrag aus /containers/json) veröffentlicht."""
+    return {int(p["PublicPort"]) for p in c.get("Ports") or [] if p.get("PublicPort")}
+
+
 async def stack_containers(endpoint_id: int, stack_name: str) -> list[dict[str, Any]]:
     return await portainer().containers(
         endpoint_id, True, {"label": [f"com.docker.compose.project={stack_name}"]}
