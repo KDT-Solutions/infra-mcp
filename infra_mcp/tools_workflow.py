@@ -23,10 +23,12 @@ from .tools_portainer import (
     ERROR_RE,
     _block_protected_stack,
     _require_compose_type,
+    container_name as _container_name,
     env_pairs,
     fetch_logs,
     find_stack_by_name,
     precheck_stack_create,
+    published_ports as _published_ports,
     redeploy_stack,
     stack_containers,
     stack_summary,
@@ -70,10 +72,6 @@ def infra_host_history(hours: float = 24, bucket_minutes: int = 60) -> dict[str,
 # ---------------------------------------------------------------------------
 
 
-def _container_name(c: dict[str, Any]) -> str:
-    return ((c.get("Names") or ["/"])[0]).lstrip("/")
-
-
 async def _find_service_container(endpoint_id: int, stack_name: str, service: str) -> dict[str, Any] | None:
     """Container eines Compose-Dienstes. Wartet kurz, falls er noch nicht gelistet ist."""
     attempts = max(1, int(CONTAINER_APPEAR_SECONDS / max(CONTAINER_POLL_SECONDS, 0.1)))
@@ -90,10 +88,6 @@ async def _log_tail(endpoint_id: int, container: str, lines: int = LOG_TAIL_REPO
         return (await fetch_logs(endpoint_id, container, lines)).splitlines()[-lines:]
     except InfraError as exc:
         return [f"(Logs nicht lesbar: {exc})"]
-
-
-def _published_ports(c: dict[str, Any]) -> set[int]:
-    return {int(p["PublicPort"]) for p in c.get("Ports") or [] if p.get("PublicPort")}
 
 
 def _host_points_to(h: dict[str, Any], names: set[str], ports: set[int]) -> bool:
